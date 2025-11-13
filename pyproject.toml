@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livekit-murf"
+dynamic = ["version"]
+description = "LiveKit Agents Plugin for Murf"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9.0"
+authors = [{ name = "Gaurav Singh", email = "gaurav.singh@murf.ai" }]
+keywords = ["webrtc", "realtime", "audio", "livekit"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["livekit-agents>=1.2.18"]
+
+[project.urls]
+Repository = "https://github.com/murf-ai/livekit-murf"
+Issues = "https://github.com/murf-ai/livekit-murf/issues"
+
+[tool.hatch.version]
+path = "livekit/plugins/murf/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekit"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/livekit"]

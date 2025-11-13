@@ -1,0 +1,53 @@
+name: Publish to TestPyPI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install uv
+        run: pip install uv
+      
+      - name: Install ruff
+        run: uv tool install ruff
+
+      - name: Run ruff check
+        run: uv tool run ruff check --output-format=github
+
+      - name: Verify tag matches version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          FILE_VERSION=$(grep -o "version[ ]*=[ ]*\"[^\"]*\"" pyproject.toml | cut -d'"' -f2)
+          echo "Tag: $TAG_VERSION, File: $FILE_VERSION"
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "Tag does not match version in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Clean build artifacts
+        run: rm -rf dist/ build/ *.egg-info
+
+      - name: Build and Publish to TestPyPI
+        run: |
+          uv build
+          uv publish \
+            --publish-url https://test.pypi.org/legacy/ \
+            --username ${{ secrets.TEST_PYPI_API_USER }} \
+            --password ${{ secrets.TEST_PYPI_API_TOKEN }}
+        env:
+          TEST_PYPI_API_USER: ${{ secrets.TEST_PYPI_API_USER }}
+          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
