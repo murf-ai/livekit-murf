@@ -36,10 +36,10 @@ jobs:
       - name: Verify tag matches version
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          FILE_VERSION=$(grep -o "version[ ]*=[ ]*\"[^\"]*\"" livekit/plugins/murf/version.py | cut -d'"' -f2)
+          FILE_VERSION=$(grep -o "__version__[ ]*=[ ]*\"[^\"]*\"" livekit/plugins/murf/version.py | cut -d'"' -f2)
           echo "Tag: $TAG_VERSION, File: $FILE_VERSION"
           if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
-            echo "Tag does not match version in pyproject.toml"
+            echo "Tag does not match version in livekit/plugins/murf/version.py"
             exit 1
           fi
 
