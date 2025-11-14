@@ -8,18 +8,18 @@ Official [Murf AI](https://murf.ai/api) Text-to-Speech integration for [Livekit 
 > **Note**: This integration is maintained by Murf AI. As the official provider of the TTS service, we are committed to actively maintaining and updating this integration.
 
 
-# Installation
+## Installation
 
 ```bash
 pip install livekit-murf
 ```
 
-# Starter Project 
+## Livekit Starter Project 
 
 ```python
 from livekit.agents import JobContext, WorkerOptions, cli, JobProcess, get_job_context
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import openai, silero, deepgram, murf
+from livekit.plugins import murf, openai, silero, deepgram
 
 class MyAgent(Agent):
     def __init__(self) -> None:
