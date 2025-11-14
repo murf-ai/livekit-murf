@@ -43,7 +43,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build and Publish to Test PyPI
+      - name: Build and Publish to PyPI
         run: |
           uv build
           uv publish \
