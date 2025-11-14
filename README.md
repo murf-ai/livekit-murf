@@ -32,7 +32,7 @@ class MyAgent(Agent):
         )
 
     async def on_enter(self):
-        await self.session.say("Hi, I am a voice agent powered by Murf Voices, how can I help you?")
+        await self.session.say("Hi, I am a voice agent powered by Murf, how can I help you?")
 
 
 
@@ -61,3 +61,5 @@ if __name__ == "__main__":
 ## Pre-requisites
 
 You'll need an API key from [Murf AI](https://murf.ai/api). It can be set as an environment variable: `MURF_API_KEY` 
+
+> **Compatibility**: Requires livekit-agents >= 1.2.18.
