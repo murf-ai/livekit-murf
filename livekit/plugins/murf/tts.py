@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import weakref
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -69,6 +70,8 @@ class TTS(tts.TTS):
         sample_rate: int = 24000,
         encoding: TTSEncoding = "pcm",
         base_url: str = "https://global.api.murf.ai",
+        disable_websocket: bool = False,
+        verbose: bool = True,
         http_session: aiohttp.ClientSession | None = None,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         text_pacing: tts.SentenceStreamPacer | bool = False,
@@ -90,15 +93,28 @@ class TTS(tts.TTS):
             encoding (str, optional): The audio encoding format. Defaults to "pcm".
             http_session (aiohttp.ClientSession | None, optional): An existing aiohttp ClientSession to use. If not provided, a new session will be created.
             base_url (str, optional): The base URL for the Murf AI API. Defaults to "https://global.api.murf.ai".
+            disable_websocket (bool, optional): Disables websocket streaming and uses HTTP streaming endpoint. Defaults to False.
+            verbose (bool, optional): Logs verbose information. Useful for debugging. Defaults to True.
             tokenizer (tokenize.SentenceTokenizer, optional): The tokenizer to use. Defaults to tokenize.basic.SentenceTokenizer(min_sentence_len=BUFFERED_WORDS_COUNT).
             text_pacing (tts.SentenceStreamPacer | bool, optional): Stream pacer for the TTS. Set to True to use the default pacer, False to disable.
         """  # noqa: E501
 
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=True),
+            capabilities=tts.TTSCapabilities(streaming=not disable_websocket),
             sample_rate=sample_rate,
             num_channels=1,
         )
+
+        if verbose:
+            logger.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.WARNING)
+
+        logger.info(
+            "Murf TTS initialized: model=%s, voice=%s, locale=%s, sample_rate=%d, encoding=%s, disable_websocket=%s, verbose=%s",
+            model, voice, locale, sample_rate, encoding, disable_websocket, verbose
+        )
+
 
         murf_api_key = api_key or os.environ.get("MURF_API_KEY")
         if not murf_api_key:
@@ -142,11 +158,14 @@ class TTS(tts.TTS):
         return "Murf"
 
     async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
+        logger.info("Connecting to Murf WebSocket (timeout=%.1fs)", timeout)
         session = self._ensure_session()
         url = self._opts.get_ws_url(
             f"/v1/speech/stream-input?api-key={self._opts.api_key}&sample_rate={self._opts.sample_rate}&format={self._opts.encoding}&model={self._opts.model}"
         )
-        return await asyncio.wait_for(session.ws_connect(url), timeout)
+        ws = await asyncio.wait_for(session.ws_connect(url), timeout)
+        logger.info("Murf WebSocket connected successfully")
+        return ws
 
     async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await ws.close()
@@ -182,6 +201,7 @@ class TTS(tts.TTS):
             speed (int | None, optional): Controls the speech speed. Positive values increase speed, negative values decrease it. Valid range: -50 to 50.
             pitch (int | None, optional): Controls the speech pitch. Positive values raise pitch, negative values lower it. Valid range: -50 to 50.
         """
+
         if is_given(locale):
             self._opts.locale = locale
         if is_given(voice):
@@ -192,6 +212,11 @@ class TTS(tts.TTS):
             self._opts.speed = speed
         if is_given(pitch):
             self._opts.pitch = pitch
+
+        logger.info(
+            "TTS options updated: voice=%s, locale=%s, style=%s, speed=%s, pitch=%s",
+            self._opts.voice, self._opts.locale, self._opts.style, self._opts.speed, self._opts.pitch
+        )
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -222,6 +247,10 @@ class ChunkedStream(tts.ChunkedStream):
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        logger.info(
+            "Starting HTTP chunked synthesis: voice=%s, text_len=%d, model=%s, locale=%s, style=%s, speed=%s, pitch=%s, encoding=%s, sample_rate=%s",
+            self._opts.voice, len(self._input_text), self._opts.model, self._opts.locale, self._opts.style, self._opts.speed, self._opts.pitch, self._opts.encoding, self._opts.sample_rate
+        )
         try:
             async with self._tts._ensure_session().post(
                 self._opts.get_http_url("/v1/speech/stream"),
@@ -240,7 +269,7 @@ class ChunkedStream(tts.ChunkedStream):
                 timeout=aiohttp.ClientTimeout(total=30, sock_connect=self._conn_options.timeout),
             ) as resp:
                 resp.raise_for_status()
-
+                logger.info("HTTP chunked synthesis stream started, status=%d", resp.status)
                 output_emitter.initialize(
                     request_id=utils.shortuuid(),
                     sample_rate=self._opts.sample_rate,
@@ -252,13 +281,17 @@ class ChunkedStream(tts.ChunkedStream):
                     output_emitter.push(data)
 
                 output_emitter.flush()
+                logger.info("HTTP chunked synthesis stream completed")
         except asyncio.TimeoutError:
+            logger.info("HTTP synthesis timed out")
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
+            logger.error("HTTP synthesis error: status=%d, message=%s", e.status, e.message)
             raise APIStatusError(
                 message=e.message, status_code=e.status, request_id=None, body=None
             ) from None
         except Exception as e:
+            logger.error("HTTP synthesis error: %s", e)
             raise APIConnectionError() from e
 
 
@@ -270,6 +303,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
+        logger.info("Starting WebSocket stream synthesis, request_id=%s", request_id)
         output_emitter.initialize(
             request_id=request_id,
             sample_rate=self._opts.sample_rate,
@@ -289,15 +323,18 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         async def _sentence_stream_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             context_id = utils.shortuuid()
+            logger.info("Starting sentence stream, context_id=%s", context_id)
             base_pkt = _to_murf_websocket_pkt(self._opts)
             async for ev in sent_tokenizer_stream:
                 token_pkt = base_pkt.copy()
                 token_pkt["context_id"] = context_id
                 token_pkt["text"] = ev.token + " "
+                logger.info("WS Sending text size=%d for context_id=%s", len(ev.token), context_id)
                 self._mark_started()
                 await ws.send_str(json.dumps(token_pkt))
                 input_sent_event.set()
 
+            logger.info("WS Sending end-of-stream marker for context_id=%s", context_id)
             end_pkt = base_pkt.copy()
             end_pkt["context_id"] = context_id
             end_pkt["end"] = True
@@ -339,9 +376,11 @@ class SynthesizeStream(tts.SynthesizeStream):
                     output_emitter.start_segment(segment_id=current_segment_id)
                 if data.get("audio"):
                     b64data = base64.b64decode(data["audio"])
+                    logger.info("WS Received audio data for context_id=%s and size=%d", segment_id, len(b64data))
                     output_emitter.push(b64data)
                 elif data.get("final"):
                     if sent_tokenizer_stream.closed:
+                        logger.info("WS Closing input stream after final message for context_id=%s", segment_id)
                         # close only if the input stream is closed
                         output_emitter.end_input()
                         break
@@ -359,6 +398,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 try:
                     await asyncio.gather(*tasks)
                 finally:
+                    logger.info("WS cleaning up stream tasks for request_id=%s", request_id)
                     input_sent_event.set()
                     await sent_tokenizer_stream.aclose()
                     await utils.aio.gracefully_cancel(*tasks)
