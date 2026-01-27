@@ -103,8 +103,8 @@ class TTS(tts.TTS):
             text_pacing (tts.SentenceStreamPacer | bool, optional): Stream pacer for the TTS. Set to True to use the default pacer, False to disable.
             min_buffer_size (int, optional):Minimum characters to buffer before sending text to audio when no sentence boundary is detected. Higher values improve quality; lower values reduce TTFB. Defaults to 40.
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
-            streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
+            streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
         """  # noqa: E501
 
         self._streaming = streaming
@@ -243,6 +243,21 @@ class ChunkedStream(tts.ChunkedStream):
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        request_id = utils.shortuuid()
+        request_start_time = time.perf_counter()
+
+        if self._tts._is_verbose():
+            logger.info(
+                "[Murf TTS] HTTP request started - request_id=%s, voice=%s, style=%s, locale=%s, "
+                "model=%s, endpoint=%s",
+                request_id,
+                self._opts.voice,
+                self._opts.style,
+                self._opts.locale,
+                self._opts.model,
+                self._opts.base_url,
+            )
+
         try:
             async with self._tts._ensure_session().post(
                 self._opts.get_http_url("/v1/speech/stream"),
@@ -263,23 +278,32 @@ class ChunkedStream(tts.ChunkedStream):
                 resp.raise_for_status()
 
                 output_emitter.initialize(
-                    request_id=utils.shortuuid(),
+                    request_id=request_id,
                     sample_rate=self._opts.sample_rate,
                     num_channels=1,
                     mime_type="audio/pcm",
                 )
 
+                first_chunk = True
                 async for data, _ in resp.content.iter_chunks():
+                    if first_chunk:
+                        first_chunk = False
+                        if self._tts._is_verbose():
+                            ttfb_ms = (time.perf_counter() - request_start_time) * 1000.0
+                            logger.info("[Murf TTS] HTTP TTFB: %.2f ms, request_id=%s", ttfb_ms, request_id)
                     output_emitter.push(data)
 
                 output_emitter.flush()
         except asyncio.TimeoutError:
+            logger.error("[Murf TTS] HTTP request timed out - request_id=%s", request_id)
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
+            logger.error("[Murf TTS] HTTP error %d: %s - request_id=%s", e.status, e.message, request_id)
             raise APIStatusError(
                 message=e.message, status_code=e.status, request_id=None, body=None
             ) from None
         except Exception as e:
+            logger.error("[Murf TTS] HTTP request failed: %s - request_id=%s", str(e), request_id)
             raise APIConnectionError() from e
 
 
