@@ -319,6 +319,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if first_sent:
                     first_sent = False
                     first_chunk_sent_time = time.perf_counter()
+                    if self._tts._is_verbose():
+                        logger.info(
+                            "[Murf TTS] Stream started - context_id=%s, voice=%s, style=%s, locale=%s, "
+                            "min_buffer_size=%d, max_buffer_delay_in_ms=%d, endpoint=%s",
+                            context_id,
+                            self._opts.voice,
+                            self._opts.style,
+                            self._opts.locale,
+                            self._opts.min_buffer_size,
+                            self._opts.max_buffer_delay_in_ms,
+                            self._opts.base_url,
+                        )
                 input_sent_event.set()
 
             end_pkt = base_pkt.copy()
