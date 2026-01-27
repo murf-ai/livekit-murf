@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
+import time
 import weakref
 from dataclasses import dataclass, replace
 from typing import Any
@@ -49,6 +51,7 @@ class _TTSOptions:
     base_url: str
     min_buffer_size: int
     max_buffer_delay_in_ms: int
+    verbose: bool
 
     def get_http_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -76,6 +79,7 @@ class TTS(tts.TTS):
         text_pacing: tts.SentenceStreamPacer | bool = False,
         min_buffer_size: int = 40,
         max_buffer_delay_in_ms: int = 0,
+        verbose: bool = False,
     ) -> None:
         """
         Create a new instance of Murf AI TTS.
@@ -98,6 +102,7 @@ class TTS(tts.TTS):
             text_pacing (tts.SentenceStreamPacer | bool, optional): Stream pacer for the TTS. Set to True to use the default pacer, False to disable.
             min_buffer_size (int, optional):Minimum characters to buffer before sending text to audio when no sentence boundary is detected. Higher values improve quality; lower values reduce TTFB. Defaults to 40.
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
+            verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
         """  # noqa: E501
 
         super().__init__(
@@ -123,6 +128,7 @@ class TTS(tts.TTS):
             base_url=base_url,
             min_buffer_size=min_buffer_size,
             max_buffer_delay_in_ms=max_buffer_delay_in_ms,
+            verbose=verbose,
         )
         self._session = http_session
         self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
@@ -148,6 +154,9 @@ class TTS(tts.TTS):
     @property
     def provider(self) -> str:
         return "Murf"
+
+    def _is_verbose(self) -> bool:
+        return self._opts.verbose or logger.isEnabledFor(logging.DEBUG)
 
     async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
         session = self._ensure_session()
@@ -287,6 +296,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         )
 
         input_sent_event = asyncio.Event()
+        first_chunk_sent_time: float | None = None
 
         sent_tokenizer_stream = self._tts._sentence_tokenizer.stream()
         if self._tts._stream_pacer:
@@ -296,14 +306,21 @@ class SynthesizeStream(tts.SynthesizeStream):
             )
 
         async def _sentence_stream_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal first_chunk_sent_time
             context_id = utils.shortuuid()
             base_pkt = _to_murf_websocket_pkt(self._opts)
+            first_sent = True
             async for ev in sent_tokenizer_stream:
                 token_pkt = base_pkt.copy()
                 token_pkt["context_id"] = context_id
                 token_pkt["text"] = ev.token + " "
                 self._mark_started()
                 await ws.send_str(json.dumps(token_pkt))
+                if first_sent:
+                    first_sent = False
+                    first_chunk_sent_time = time.perf_counter()
+                    if self._tts._is_verbose():
+                        logger.info("First chunk sent to Murf API")
                 input_sent_event.set()
 
             end_pkt = base_pkt.copy()
@@ -323,7 +340,9 @@ class SynthesizeStream(tts.SynthesizeStream):
             sent_tokenizer_stream.end_input()
 
         async def _recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal first_chunk_sent_time
             current_segment_id: str | None = None
+            first_audio_received = True
             await input_sent_event.wait()
             while True:
                 msg = await ws.receive()
@@ -346,6 +365,12 @@ class SynthesizeStream(tts.SynthesizeStream):
                     current_segment_id = segment_id
                     output_emitter.start_segment(segment_id=current_segment_id)
                 if data.get("audio"):
+                    if first_audio_received:
+                        first_audio_received = False
+                        if first_chunk_sent_time is not None:
+                            ttfb_ms = (time.perf_counter() - first_chunk_sent_time) * 1000.0
+                            if self._tts._is_verbose():
+                                logger.info("[Murf TTS TTFB] (first sentence to first audio): %.2f ms", ttfb_ms)
                     b64data = base64.b64decode(data["audio"])
                     output_emitter.push(b64data)
                 elif data.get("final"):
