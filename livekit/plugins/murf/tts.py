@@ -77,7 +77,7 @@ class TTS(tts.TTS):
         http_session: aiohttp.ClientSession | None = None,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         text_pacing: tts.SentenceStreamPacer | bool = False,
-        min_buffer_size: int = 40,
+        min_buffer_size: int = 3,
         max_buffer_delay_in_ms: int = 0,
         streaming: bool = True,
         verbose: bool = False,
@@ -101,7 +101,7 @@ class TTS(tts.TTS):
             base_url (str, optional): The base URL for the Murf AI API. Defaults to "https://global.api.murf.ai".
             tokenizer (tokenize.SentenceTokenizer, optional): The tokenizer to use. Defaults to tokenize.basic.SentenceTokenizer(min_sentence_len=BUFFERED_WORDS_COUNT).
             text_pacing (tts.SentenceStreamPacer | bool, optional): Stream pacer for the TTS. Set to True to use the default pacer, False to disable.
-            min_buffer_size (int, optional):Minimum characters to buffer before sending text to audio when no sentence boundary is detected. Higher values improve quality; lower values reduce TTFB. Defaults to 40.
+            min_buffer_size (int, optional):Minimum characters to buffer before sending text to audio when no sentence boundary is detected. Higher values improve quality; lower values reduce TTFB. Defaults to 3.
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
             streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
@@ -143,7 +143,7 @@ class TTS(tts.TTS):
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
         self._sentence_tokenizer = (
-            tokenizer if is_given(tokenizer) else tokenize.blingfire.SentenceTokenizer()
+            tokenizer if is_given(tokenizer) else tokenize.blingfire.SentenceTokenizer(min_sentence_len=min_buffer_size)
         )
         self._stream_pacer: tts.SentenceStreamPacer | None = None
         if text_pacing is True:
