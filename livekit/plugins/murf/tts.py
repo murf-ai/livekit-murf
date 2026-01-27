@@ -101,7 +101,7 @@ class TTS(tts.TTS):
             tokenizer (tokenize.SentenceTokenizer, optional): The tokenizer to use. Defaults to tokenize.basic.SentenceTokenizer(min_sentence_len=BUFFERED_WORDS_COUNT).
             text_pacing (tts.SentenceStreamPacer | bool, optional): Stream pacer for the TTS. Set to True to use the default pacer, False to disable.
             min_buffer_size (int, optional):Minimum characters to buffer before sending text to audio when no sentence boundary is detected. Higher values improve quality; lower values reduce TTFB. Defaults to 40.
-            max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
+            max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
         """  # noqa: E501
 
@@ -319,8 +319,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if first_sent:
                     first_sent = False
                     first_chunk_sent_time = time.perf_counter()
-                    if self._tts._is_verbose():
-                        logger.info("First chunk sent to Murf API")
                 input_sent_event.set()
 
             end_pkt = base_pkt.copy()
@@ -351,12 +349,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                     aiohttp.WSMsgType.CLOSE,
                     aiohttp.WSMsgType.CLOSING,
                 ):
+                    logger.error("[Murf TTS] Connection closed unexpectedly")
                     raise APIStatusError(
                         "Murf AI connection closed unexpectedly", request_id=request_id
                     )
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.warning("unexpected Murf AI message type %s", msg.type)
+                    logger.warning("[Murf TTS] Unexpected message type %s", msg.type)
                     continue
 
                 data = json.loads(msg.data)
@@ -370,7 +369,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         if first_chunk_sent_time is not None:
                             ttfb_ms = (time.perf_counter() - first_chunk_sent_time) * 1000.0
                             if self._tts._is_verbose():
-                                logger.info("[Murf TTS TTFB] (first sentence to first audio): %.2f ms", ttfb_ms)
+                                logger.info("[Murf TTS] Murf TTFB (first sentence to first audio): %.2f ms", ttfb_ms)
                     b64data = base64.b64decode(data["audio"])
                     output_emitter.push(b64data)
                 elif data.get("final"):
@@ -379,7 +378,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         output_emitter.end_input()
                         break
                 else:
-                    logger.warning("unexpected message %s", data)
+                    logger.warning("[Murf TTS] Unexpected message %s", data)
 
         try:
             async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
@@ -398,10 +397,12 @@ class SynthesizeStream(tts.SynthesizeStream):
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
+            logger.error("[Murf TTS] WebSocket error %d: %s", e.status, e.message)
             raise APIStatusError(
                 message=e.message, status_code=e.status, request_id=None, body=None
             ) from None
         except Exception as e:
+            logger.error("[Murf TTS] WebSocket connection failed: %s", str(e))
             raise APIConnectionError() from e
 
 
