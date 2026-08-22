@@ -44,7 +44,7 @@ class _TTSOptions:
     model: TTSModels | str
     voice: str
     style: str | None
-    speed: int | None
+    rate: int | None
     pitch: int | None
     sample_rate: int
     encoding: TTSEncoding
@@ -69,7 +69,7 @@ class TTS(tts.TTS):
         locale: TTSLocales | str | None = None,
         voice: str = TTSDefaultVoiceId,
         style: TTSStyles | str | None = None,
-        speed: int | None = None,
+        rate: int | None = None,
         pitch: int | None = None,
         sample_rate: int = 24000,
         encoding: TTSEncoding = "pcm",
@@ -93,7 +93,7 @@ class TTS(tts.TTS):
             locale (str | None, optional): The locale for synthesis (e.g., "en-US", "en-UK"). If not provided, will be inferred from voice.
             voice (str, optional): The voice ID from Murf AI's voice library (e.g., "en-US-matthew"). Defaults to TTSDefaultVoiceId.
             style (TTSStyles | str | None, optional): The voice style to apply (e.g., "Conversation"). Can be None for default style.
-            speed (int | None, optional): The speech speed control. Higher values = faster speech. None for default speed.
+            rate (int | None, optional): The speech rate control. Higher values = faster speech. None for default rate.
             pitch (int | None, optional): The speech pitch control. Higher values = higher pitch. None for default pitch.
             sample_rate (int, optional): The audio sample rate in Hz. Defaults to 24000.
             encoding (str, optional): The audio encoding format. Defaults to "pcm".
@@ -125,7 +125,7 @@ class TTS(tts.TTS):
             locale=locale,
             voice=voice,
             style=style or TTSDefaultVoiceStyle,
-            speed=speed,
+            rate=rate,
             pitch=pitch,
             sample_rate=sample_rate,
             encoding=encoding,
@@ -187,20 +187,20 @@ class TTS(tts.TTS):
         locale: NotGivenOr[str] = NOT_GIVEN,
         voice: NotGivenOr[str] = NOT_GIVEN,
         style: NotGivenOr[str | None] = NOT_GIVEN,
-        speed: NotGivenOr[int | None] = NOT_GIVEN,
+        rate: NotGivenOr[int | None] = NOT_GIVEN,
         pitch: NotGivenOr[int | None] = NOT_GIVEN,
     ) -> None:
         """
         Update the Text-to-Speech (TTS) configuration options.
 
         This method allows updating the TTS settings, including model, locale, voice, style,
-        speed and pitch. If any parameter is not provided, the existing value will be retained.
+        rate and pitch. If any parameter is not provided, the existing value will be retained.
 
         Args:
             locale (str, optional): The locale for synthesis (e.g., "en-US", "en-UK").
             voice (str, optional): The voice ID from Murf AI's voice library. (e.g. "en-US-matthew")
             style (str | None, optional): The voice style to apply (e.g., "Conversation", "Promo").
-            speed (int | None, optional): Controls the speech speed. Positive values increase speed, negative values decrease it. Valid range: -50 to 50.
+            rate (int | None, optional): Controls the speech rate. Positive values increase rate, negative values decrease it. Valid range: -50 to 50.
             pitch (int | None, optional): Controls the speech pitch. Positive values raise pitch, negative values lower it. Valid range: -50 to 50.
         """
         if is_given(locale):
@@ -209,8 +209,8 @@ class TTS(tts.TTS):
             self._opts.voice = voice
         if is_given(style):
             self._opts.style = style
-        if is_given(speed):
-            self._opts.speed = speed
+        if is_given(rate):
+            self._opts.rate = rate
         if is_given(pitch):
             self._opts.pitch = pitch
 
@@ -268,7 +268,7 @@ class ChunkedStream(tts.ChunkedStream):
                     "multiNativeLocale": self._opts.locale,
                     "voice_id": self._opts.voice,
                     "style": self._opts.style,
-                    "rate": self._opts.speed,
+                    "rate": self._opts.rate,
                     "pitch": self._opts.pitch,
                     "format": self._opts.encoding,
                     "sample_rate": self._opts.sample_rate,
@@ -359,7 +359,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                             self._opts.max_buffer_delay_in_ms,
                             self._opts.base_url,
                         )
-                input_sent_event.set()
 
             end_pkt = base_pkt.copy()
             end_pkt["context_id"] = context_id
@@ -455,8 +454,8 @@ def _to_murf_websocket_pkt(opts: _TTSOptions) -> dict[str, Any]:
     if opts.style:
         voice_config["style"] = opts.style
 
-    if opts.speed:
-        voice_config["rate"] = opts.speed
+    if opts.rate:
+        voice_config["rate"] = opts.rate
 
     if opts.pitch:
         voice_config["pitch"] = opts.pitch
