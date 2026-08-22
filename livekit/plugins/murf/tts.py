@@ -462,7 +462,7 @@ def _to_murf_websocket_pkt(opts: _TTSOptions) -> dict[str, Any]:
         voice_config["pitch"] = opts.pitch
 
     if opts.locale:
-        voice_config["multi_native_locale"] = opts.locale
+        voice_config["multiNativeLocale"] = opts.locale
 
     return {
         "voice_config": voice_config,
