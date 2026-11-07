@@ -3,10 +3,11 @@
 ![Murf AI Logo](https://murf.ai/public-assets/home/Murf_Logo.png)
 
 
-Official [Murf AI](https://murf.ai/api) Text-to-Speech integration for [Livekit Agents](https://github.com/livekit/agents) - a framework for building voice and multimodal conversational AI applications.
+[Murf AI](https://murf.ai/api) text-to-speech and speech-to-text for [Livekit Agents](https://github.com/livekit/agents).
 
-> **Note**: This integration is maintained by Murf AI. As the official provider of the TTS service, we are committed to actively maintaining and updating this integration.
+> **Note**: This integration is maintained by Murf AI.
 
+Use this package for both speech and transcription. `murf.TTS` follows the same Murf requests as [LiveKit's Murf TTS plugin](https://docs.livekit.io/agents/models/tts/murf/): Falcon by default, `api-key` header, and the same voice, style, rate, pitch, and locale fields. Do not install `livekit-plugins-murf` in the same environment. Both packages provide `livekit.plugins.murf`, and the later install replaces the other.
 
 ## Installation
 
@@ -14,20 +15,29 @@ Official [Murf AI](https://murf.ai/api) Text-to-Speech integration for [Livekit 
 pip install livekit-murf
 ```
 
-## Livekit Starter Project 
+```python
+from livekit.plugins import murf
+
+session = AgentSession(
+    stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
+    tts=murf.TTS(voice="Gordon", style="Conversational", model="FALCON"),
+)
+```
+
+## Livekit Starter Project
 
 ```python
 from livekit.agents import JobContext, WorkerOptions, cli, JobProcess, get_job_context
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import murf, openai, silero, deepgram
+from livekit.plugins import murf, openai, silero
 
 class MyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="You are a voice agent build using Murf TTS",
-            stt=deepgram.STT(model="nova-3"),
+            instructions="You are a voice agent build using Murf",
+            stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
             llm=openai.LLM(model="gpt-4o"),
-            tts=murf.TTS(voice="en-US-matthew", style="Conversation"),
+            tts=murf.TTS(voice="Gordon", style="Conversational", model="FALCON"),
             vad=get_job_context().proc.userdata["vad"],
         )
 
@@ -57,6 +67,18 @@ def prewarm(proc: JobProcess):
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
 ```
+
+## Speech to Text
+
+`murf.STT` streams PCM audio to Murf's [streaming transcription](https://murf.ai/api/docs/speech-to-text/streaming) WebSocket.
+
+`finch_global_1.0` (`us-east.api.murf.ai`) transcribes English and European languages. `finch_indic_1.0` (`in.api.murf.ai`) transcribes English (India) and Indic languages. `language="auto"` detects among the languages of the connected model. A comma-separated list, or a list of codes, detects only from those languages.
+
+```python
+stt=murf.STT(model="finch_indic_1.0", language="hi,te")
+```
+
+Partials are interim transcripts. Murf sends a final when the caller pauses. LiveKit's turn detection decides when the agent replies.
 
 ## Pre-requisites
 

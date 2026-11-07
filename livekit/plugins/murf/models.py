@@ -57,5 +57,36 @@ TTSEncoding = Literal[
     "pcm",  # pcm_s16le
 ]
 
-TTSDefaultVoiceId = "en-US-matthew"
+TTSDefaultVoiceId = "Gordon"
 TTSDefaultVoiceStyle = "Conversation"
+
+STTModels = Literal["finch_indic_1.0", "finch_global_1.0"]
+
+# Murf language codes. `auto` detects among the languages of the connected model.
+# Finch-Indic also accepts an India region suffix (for example `hi_IN`).
+STTLanguages = Literal[
+    "auto",
+    "en",
+    "en_IN",
+    "as",
+    "bn",
+    "gu",
+    "hi",
+    "kn",
+    "ml",
+    "mr",
+    "or",
+    "pa",
+    "ta",
+    "te",
+    "de",
+    "es",
+    "fr",
+    "it",
+    "pt",
+    "nl",
+]
+
+# LiveKit audio frames are PCM. Telephony codecs are declared by Murf but are not
+# produced by the agent audio path.
+STTEncoding = Literal["pcm_s16le"]

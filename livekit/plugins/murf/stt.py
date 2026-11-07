@@ -1,0 +1,891 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+import weakref
+from dataclasses import dataclass, replace
+from typing import Any
+from urllib.parse import urlencode
+
+import aiohttp
+
+from livekit import rtc
+from livekit.agents import (
+    APIConnectionError,
+    APIConnectOptions,
+    APIStatusError,
+    APITimeoutError,
+    LanguageCode,
+    stt,
+    utils,
+)
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
+from livekit.agents.utils import AudioBuffer, is_given
+from livekit.agents.voice.io import TimedString
+
+from .log import logger
+from .models import STTLanguages, STTModels
+
+API_AUTH_HEADER = "api-key"
+STREAM_PATH = "/v1/transcription/stream-input"
+SUPPORTED_SAMPLE_RATES = (8000, 12000, 16000, 24000, 32000, 44100, 48000)
+_MODEL_ORIGINS = {
+    "finch_indic_1.0": "wss://in.api.murf.ai",
+    "finch_global_1.0": "wss://us-east.api.murf.ai",
+}
+_INDIC_LANGUAGES = {"as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te"}
+_GLOBAL_LANGUAGES = {"en", "de", "es", "fr", "it", "pt", "nl"}
+_RETRYABLE_CLOSE_CODES = {4004, 4008, 4010, 4011, 1006, 1011, 1012, 1013}
+_NON_RETRYABLE_CLOSE_CODES = {4001, 4002, 4003, 4005, 4006}
+_NON_RETRYABLE_MESSAGES = {"insufficient_credits", "api_key_revoked"}
+
+
+@dataclass
+class STTOptions:
+    model: STTModels | str
+    language: str
+    language_code: LanguageCode
+    sample_rate: int
+    keywords: list[str]
+    alpha: float
+    text_formatting: bool
+    bvc: bool
+    base_url: str | None
+    audio_chunk_duration_ms: int
+
+    def ws_url(self) -> str:
+        origin = _origin_for(self.model, self.base_url).rstrip("/")
+        if origin.endswith(STREAM_PATH):
+            base = origin
+        else:
+            base = f"{origin}{STREAM_PATH}"
+        # Keep commas so language=hi,en_IN and keywords stay in Murf's query form.
+        return f"{base}?{urlencode(_query_params(self), safe=',')}"
+
+
+class STT(stt.STT):
+    def __init__(
+        self,
+        *,
+        model: STTModels | str = "finch_global_1.0",
+        language: STTLanguages | str | list[str] = "auto",
+        sample_rate: int = 16000,
+        keywords: list[str] | None = None,
+        alpha: float = 0.5,
+        text_formatting: bool = False,
+        bvc: bool = False,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        http_session: aiohttp.ClientSession | None = None,
+        audio_chunk_duration_ms: int = 50,
+    ) -> None:
+        """Create a new instance of Murf STT.
+
+        See https://murf.ai/api/docs/speech-to-text/streaming for the streaming API.
+
+        Args:
+            model: ``finch_global_1.0`` (English and European languages, US East) or
+                ``finch_indic_1.0`` (English (India) and Indic languages, India).
+                Defaults to ``finch_global_1.0``.
+            language: Language of the audio. ``auto`` detects among the languages of
+                the connected model. Pass several languages as a comma-separated
+                string, for example ``"hi,en_IN"`` or ``"fr,en"``, or as a list
+                such as ``["hi", "en_IN"]``. Murf then detects only from that set.
+                BCP-47 tags such as ``en-US`` or ``hi-IN`` are mapped to Murf's codes.
+            sample_rate: Sample rate of audio sent to Murf, in Hz. Incoming frames are
+                resampled to this rate. Must be one of 8000, 12000, 16000, 24000,
+                32000, 44100, 48000. Defaults to 16000.
+            keywords: Words or phrases to boost. Joined into Murf's comma-separated
+                ``keywords`` query parameter.
+            alpha: How strongly to favour ``keywords``, from 0.0 to 1.0. Defaults to 0.5.
+            text_formatting: Format numbers and similar terms. Applies to Hindi and
+                English (India) only. Defaults to False.
+            bvc: Remove background voices before transcription. Defaults to False.
+            api_key: Murf API key. Falls back to the ``MURF_API_KEY`` environment variable.
+            base_url: Override the model host, for example ``https://in.api.murf.ai``.
+                When omitted, the host is chosen from ``model``.
+            http_session: Existing aiohttp session. When omitted, the plugin uses the
+                LiveKit HTTP context session.
+            audio_chunk_duration_ms: Size of each binary audio frame, from 20 to 100 ms.
+                Defaults to 50.
+
+        Raises:
+            ValueError: If no API key is available, or a sample rate, alpha, or chunk
+                duration is invalid.
+        """
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=True,
+                interim_results=True,
+                diarization=False,
+                aligned_transcript="word",
+                offline_recognize=True,
+            )
+        )
+
+        murf_api_key = api_key or os.environ.get("MURF_API_KEY")
+        if not murf_api_key:
+            raise ValueError("MURF_API_KEY must be set")
+
+        self._api_key = murf_api_key
+        self._opts = _build_options(
+            model=model,
+            language=language,
+            sample_rate=sample_rate,
+            keywords=keywords or [],
+            alpha=alpha,
+            text_formatting=text_formatting,
+            bvc=bvc,
+            base_url=base_url,
+            audio_chunk_duration_ms=audio_chunk_duration_ms,
+        )
+        self._session = http_session
+        self._streams = weakref.WeakSet[SpeechStream]()
+
+    @property
+    def model(self) -> str:
+        return self._opts.model
+
+    @property
+    def provider(self) -> str:
+        return "Murf"
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if not self._session:
+            self._session = utils.http_context.http_session()
+        return self._session
+
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: NotGivenOr[STTLanguages | str | list[str]] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        opts = self._sanitize_options(language=language)
+        frames = _resample_buffer(buffer, opts.sample_rate)
+        if not frames:
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[
+                    stt.SpeechData(language=opts.language_code, text=""),
+                ],
+            )
+
+        audio_duration = sum(frame.duration for frame in frames)
+        try:
+            ws = await _connect_ws(self._ensure_session(), opts, self._api_key, conn_options.timeout)
+        except asyncio.TimeoutError:
+            raise APIConnectionError("failed to connect to Murf STT") from None
+
+        try:
+            bstream = utils.audio.AudioByteStream(
+                sample_rate=opts.sample_rate,
+                num_channels=1,
+                samples_per_channel=opts.sample_rate * opts.audio_chunk_duration_ms // 1000,
+            )
+            pcm = b"".join(frame.data.tobytes() for frame in frames)
+            chunks = bstream.push(pcm)
+            chunks.extend(bstream.flush())
+            for chunk in chunks:
+                await ws.send_bytes(chunk.data.tobytes())
+                await asyncio.sleep(chunk.duration)
+
+            await ws.send_str(json.dumps({"type": "CloseStream"}))
+
+            transcripts: list[str] = []
+            words: list[TimedString] = []
+            request_id = ""
+            start_time = 0.0
+            end_time = 0.0
+            server_error: dict[str, Any] | None = None
+            deadline = audio_duration + max(conn_options.timeout, 5.0)
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            while True:
+                remaining = deadline - (loop.time() - started)
+                if remaining <= 0:
+                    raise APITimeoutError() from None
+                msg = await asyncio.wait_for(ws.receive(), remaining)
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    if server_error or (ws.close_code not in (None, 1000, 1001)):
+                        raise _error_from_close(ws, msg, server_error)
+                    break
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                msg_type = data.get("type")
+                if msg_type == "Error":
+                    server_error = data
+                    continue
+                if msg_type == "QuotaWarning":
+                    logger.warning("[Murf STT] Low balance: %s", data.get("remaining_funds"))
+                    continue
+                if msg_type != "final":
+                    continue
+                text = data.get("transcript") or ""
+                raw = data.get("rawEvent") or {}
+                request_id = raw.get("request_id") or request_id
+                if not text:
+                    continue
+                transcripts.append(text)
+                speech = _speech_data(
+                    opts.language_code,
+                    text,
+                    raw,
+                    include_words=True,
+                    time_offset=0.0,
+                )
+                if speech.words:
+                    words.extend(speech.words)
+                if len(transcripts) == 1:
+                    start_time = speech.start_time
+                end_time = speech.end_time
+
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id=request_id,
+                alternatives=[
+                    stt.SpeechData(
+                        language=opts.language_code,
+                        text=" ".join(transcripts),
+                        start_time=start_time,
+                        end_time=end_time,
+                        words=words or None,
+                    )
+                ],
+            )
+        except APIStatusError:
+            raise
+        except asyncio.TimeoutError:
+            raise APITimeoutError() from None
+        finally:
+            await ws.close()
+
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[STTLanguages | str | list[str]] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SpeechStream:
+        stream = SpeechStream(
+            stt=self,
+            opts=self._sanitize_options(language=language),
+            conn_options=conn_options,
+            api_key=self._api_key,
+            http_session=self._ensure_session(),
+        )
+        self._streams.add(stream)
+        return stream
+
+    def update_options(
+        self,
+        *,
+        model: NotGivenOr[STTModels | str] = NOT_GIVEN,
+        language: NotGivenOr[STTLanguages | str | list[str]] = NOT_GIVEN,
+        keywords: NotGivenOr[list[str]] = NOT_GIVEN,
+        alpha: NotGivenOr[float] = NOT_GIVEN,
+        text_formatting: NotGivenOr[bool] = NOT_GIVEN,
+        bvc: NotGivenOr[bool] = NOT_GIVEN,
+        base_url: NotGivenOr[str | None] = NOT_GIVEN,
+    ) -> None:
+        """Update options that Murf fixes at connection time.
+
+        Open streams reconnect. Model, language, keywords, and audio format cannot
+        change on an existing Murf session.
+        """
+        opts = self._opts
+        self._opts = _build_options(
+            model=model if is_given(model) else opts.model,
+            language=language if is_given(language) else opts.language,
+            sample_rate=opts.sample_rate,
+            keywords=keywords if is_given(keywords) else opts.keywords,
+            alpha=alpha if is_given(alpha) else opts.alpha,
+            text_formatting=text_formatting if is_given(text_formatting) else opts.text_formatting,
+            bvc=bvc if is_given(bvc) else opts.bvc,
+            base_url=base_url if is_given(base_url) else opts.base_url,
+            audio_chunk_duration_ms=opts.audio_chunk_duration_ms,
+        )
+        for stream in self._streams:
+            stream.update_options(self._opts)
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(stream.aclose() for stream in list(self._streams)), return_exceptions=True)
+        self._streams.clear()
+
+    def _sanitize_options(self, *, language: NotGivenOr[STTLanguages | str | list[str]]) -> STTOptions:
+        opts = replace(self._opts, keywords=list(self._opts.keywords))
+        if is_given(language):
+            murf_language, language_code = _resolve_language(opts.model, language)
+            opts.language = murf_language
+            opts.language_code = language_code
+        return opts
+
+
+class SpeechStream(stt.SpeechStream):
+    _KEEPALIVE_MSG: str = json.dumps({"type": "KeepAlive"})
+    _CLOSE_MSG: str = json.dumps({"type": "CloseStream"})
+    _FINALIZE_MSG: str = json.dumps({"type": "Finalize"})
+
+    def __init__(
+        self,
+        *,
+        stt: STT,
+        opts: STTOptions,
+        conn_options: APIConnectOptions,
+        api_key: str,
+        http_session: aiohttp.ClientSession,
+    ) -> None:
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
+        self._opts = opts
+        self._api_key = api_key
+        self._session = http_session
+        self._speaking = False
+        self._request_id = ""
+        self._server_error: dict[str, Any] | None = None
+        self._reconnect_event = asyncio.Event()
+        self._audio_duration_collector = _PeriodicCollector(
+            callback=self._on_audio_duration_report,
+            duration=5.0,
+        )
+
+    def update_options(self, opts: STTOptions) -> None:
+        self._opts = replace(opts, keywords=list(opts.keywords))
+        self._reconnect_event.set()
+
+    async def _run(self) -> None:
+        closing_ws = False
+
+        async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            # With no audio flowing, this write is the only thing touching the socket,
+            # so a drop surfaces here first.
+            nonlocal closing_ws
+            try:
+                while True:
+                    await ws.send_str(SpeechStream._KEEPALIVE_MSG)
+                    await asyncio.sleep(5)
+            except (aiohttp.ClientError, ConnectionError) as exc:
+                if closing_ws or self._session.closed:
+                    return
+                raise APIConnectionError("Murf STT connection closed unexpectedly") from exc
+            except Exception as exc:
+                logger.warning("[Murf STT] keepalive task exited: %s", exc)
+                return
+
+        @utils.log_exceptions(logger=logger)
+        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal closing_ws
+
+            samples_per_chunk = self._opts.sample_rate * self._opts.audio_chunk_duration_ms // 1000
+            audio_bstream = utils.audio.AudioByteStream(
+                sample_rate=self._opts.sample_rate,
+                num_channels=1,
+                samples_per_channel=samples_per_chunk,
+            )
+
+            try:
+                async for data in self._input_ch:
+                    frames: list[rtc.AudioFrame] = []
+                    if isinstance(data, rtc.AudioFrame):
+                        frames.extend(audio_bstream.push(data.data.tobytes()))
+                    elif isinstance(data, self._FlushSentinel):
+                        frames.extend(audio_bstream.flush())
+
+                    for frame in frames:
+                        self._audio_duration_collector.push(frame.duration)
+                        await ws.send_bytes(frame.data.tobytes())
+
+                    if isinstance(data, self._FlushSentinel):
+                        self._audio_duration_collector.flush()
+                        await ws.send_str(SpeechStream._FINALIZE_MSG)
+
+                closing_ws = True
+                self._audio_duration_collector.flush()
+                await ws.send_str(SpeechStream._CLOSE_MSG)
+            except (aiohttp.ClientError, ConnectionError) as exc:
+                if closing_ws or self._session.closed:
+                    return
+                raise APIConnectionError("Murf STT connection closed unexpectedly") from exc
+
+        @utils.log_exceptions(logger=logger)
+        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal closing_ws
+            monitor_cls = getattr(utils.aio, "WebSocketMonitor", None)
+            if monitor_cls is not None:
+                liveness_timeout = getattr(self._conn_options, "liveness_timeout", 6.0)
+                receive = monitor_cls(ws, liveness_timeout=liveness_timeout).receive
+            else:
+                receive = ws.receive
+
+            while True:
+                msg = await receive()
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    if closing_ws or self._session.closed:
+                        return
+                    raise _error_from_close(ws, msg, self._server_error)
+
+                if msg.type == aiohttp.WSMsgType.ERROR:
+                    if closing_ws or self._session.closed:
+                        return
+                    raise APIConnectionError("Murf STT connection lost") from ws.exception()
+
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.warning("[Murf STT] unexpected message type %s", msg.type)
+                    continue
+
+                try:
+                    self._process_stream_event(json.loads(msg.data))
+                except APIStatusError:
+                    raise
+                except Exception:
+                    logger.exception("[Murf STT] failed to process message")
+
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        while True:
+            closing_ws = False
+            try:
+                ws = await _connect_ws(
+                    self._session,
+                    self._opts,
+                    self._api_key,
+                    self._conn_options.timeout,
+                    autoping=getattr(utils.aio, "WebSocketMonitor", None) is None,
+                )
+                self._speaking = False
+                self._server_error = None
+                tasks = [
+                    asyncio.create_task(send_task(ws)),
+                    asyncio.create_task(recv_task(ws)),
+                    asyncio.create_task(keepalive_task(ws)),
+                ]
+                tasks_group = asyncio.gather(*tasks)
+                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (tasks_group, wait_reconnect_task),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        if task != wait_reconnect_task:
+                            task.result()
+
+                    if wait_reconnect_task not in done:
+                        break
+
+                    self._reconnect_event.clear()
+                finally:
+                    await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
+                    try:
+                        tasks_group.exception()
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        pass
+            finally:
+                if ws is not None:
+                    await ws.close()
+
+    def _on_audio_duration_report(self, duration: float) -> None:
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.RECOGNITION_USAGE,
+                request_id=self._request_id,
+                alternatives=[],
+                recognition_usage=stt.RecognitionUsage(audio_duration=duration),
+            )
+        )
+
+    def _process_stream_event(self, data: dict[str, Any]) -> None:
+        msg_type = data.get("type")
+        if msg_type == "QuotaWarning":
+            logger.warning("[Murf STT] Low balance: %s", data.get("remaining_funds"))
+            return
+        if msg_type == "Error":
+            self._server_error = data
+            raise _error_from_payload(data, None)
+        if msg_type not in ("partial", "final"):
+            logger.debug("[Murf STT] unexpected message %s", data)
+            return
+
+        raw = data.get("rawEvent") or {}
+        transcript = data.get("transcript") or ""
+        request_id = str(raw.get("request_id") or "")
+        if request_id:
+            self._request_id = request_id
+
+        event_name = raw.get("event")
+        if (event_name == "StartOfTurn" or transcript) and not self._speaking:
+            self._speaking = True
+            self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+
+        if msg_type == "partial":
+            if not transcript:
+                return
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                    request_id=self._request_id,
+                    alternatives=[
+                        _speech_data(
+                            self._opts.language_code,
+                            transcript,
+                            raw,
+                            include_words=False,
+                            time_offset=self.start_time_offset,
+                        )
+                    ],
+                )
+            )
+            return
+
+        if transcript:
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    request_id=self._request_id,
+                    alternatives=[
+                        _speech_data(
+                            self._opts.language_code,
+                            transcript,
+                            raw,
+                            include_words=True,
+                            time_offset=self.start_time_offset,
+                        )
+                    ],
+                )
+            )
+
+        if self._speaking:
+            self._speaking = False
+            self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+
+
+def _build_options(
+    *,
+    model: STTModels | str,
+    language: STTLanguages | str | list[str],
+    sample_rate: int,
+    keywords: list[str],
+    alpha: float,
+    text_formatting: bool,
+    bvc: bool,
+    base_url: str | None,
+    audio_chunk_duration_ms: int,
+) -> STTOptions:
+    if sample_rate not in SUPPORTED_SAMPLE_RATES:
+        raise ValueError(
+            f"sample_rate {sample_rate} is not supported. Allowed: {list(SUPPORTED_SAMPLE_RATES)}"
+        )
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be between 0.0 and 1.0")
+    if not 20 <= audio_chunk_duration_ms <= 100:
+        raise ValueError("audio_chunk_duration_ms must be between 20 and 100")
+    if model not in _MODEL_ORIGINS and not base_url:
+        raise ValueError(
+            f"unknown Murf STT model {model!r}. Pass base_url, or use one of {list(_MODEL_ORIGINS)}"
+        )
+
+    murf_language, language_code = _resolve_language(model, language)
+    cleaned_keywords = [term.strip() for term in keywords if term and term.strip()]
+    if any("," in term for term in cleaned_keywords):
+        raise ValueError("keywords cannot contain commas; pass a list of phrases instead")
+
+    return STTOptions(
+        model=model,
+        language=murf_language,
+        language_code=language_code,
+        sample_rate=sample_rate,
+        keywords=cleaned_keywords,
+        alpha=alpha,
+        text_formatting=text_formatting,
+        bvc=bvc,
+        base_url=base_url,
+        audio_chunk_duration_ms=audio_chunk_duration_ms,
+    )
+
+
+def _resolve_language(
+    model: str, language: STTLanguages | str | list[str]
+) -> tuple[str, LanguageCode]:
+    raw = _language_input(language)
+    if not raw or raw.lower() in {"auto", "multi"}:
+        return "auto", LanguageCode("multi")
+
+    if "," in raw:
+        parts = [
+            _murf_language_token(model, str(LanguageCode(part.strip())))
+            for part in raw.split(",")
+            if part.strip()
+        ]
+        if not parts:
+            return "auto", LanguageCode("multi")
+        return ",".join(parts), LanguageCode("multi")
+
+    murf_language = _murf_language_token(model, str(LanguageCode(raw)))
+    return murf_language, _language_code_for(murf_language)
+
+
+def _language_input(language: STTLanguages | str | list[str]) -> str:
+    if isinstance(language, (list, tuple)):
+        return ",".join(str(part).strip() for part in language if str(part).strip())
+    return str(language).strip()
+
+
+def _language_code_for(murf_language: str) -> LanguageCode:
+    if murf_language == "en_IN":
+        return LanguageCode("en-IN")
+    if murf_language in {"auto"} or "," in murf_language:
+        return LanguageCode("multi")
+    return LanguageCode(murf_language.replace("_", "-"))
+
+
+def _murf_language_token(model: str, language: str) -> str:
+    token = language.strip().replace("_", "-")
+    pieces = token.split("-")
+    base = pieces[0].lower()
+    region = pieces[1].upper() if len(pieces) > 1 and len(pieces[1]) == 2 else None
+    indic = str(model).startswith("finch_indic")
+
+    if indic:
+        if base == "en":
+            if region not in (None, "IN"):
+                logger.warning(
+                    "[Murf STT] %s transcribes English (India). Mapping %s to en_IN",
+                    model,
+                    language,
+                )
+            return "en_IN"
+        if base in _INDIC_LANGUAGES:
+            return base
+    else:
+        if base in _GLOBAL_LANGUAGES:
+            return base
+
+    logger.warning("[Murf STT] language %s may not be supported by model %s", language, model)
+    return language.strip()
+
+
+def _origin_for(model: str, base_url: str | None) -> str:
+    if base_url:
+        origin = base_url.strip().rstrip("/")
+        if origin.startswith("https://"):
+            return "wss://" + origin[len("https://") :]
+        if origin.startswith("http://"):
+            return "ws://" + origin[len("http://") :]
+        if origin.startswith("ws://") or origin.startswith("wss://"):
+            return origin
+        return f"wss://{origin}"
+
+    origin = _MODEL_ORIGINS.get(model)
+    if not origin:
+        raise ValueError(f"no Murf STT host for model {model!r}")
+    return origin
+
+
+def _query_params(opts: STTOptions) -> dict[str, str]:
+    params = {
+        "model": str(opts.model),
+        "language": opts.language,
+    }
+    if opts.keywords:
+        params["keywords"] = ",".join(opts.keywords)
+        params["alpha"] = str(opts.alpha)
+    if opts.text_formatting:
+        params["text_formatting"] = "true"
+    if opts.bvc:
+        params["bvc"] = "true"
+    return params
+
+
+async def _connect_ws(
+    session: aiohttp.ClientSession,
+    opts: STTOptions,
+    api_key: str,
+    timeout: float,
+    *,
+    autoping: bool = True,
+) -> aiohttp.ClientWebSocketResponse:
+    ws: aiohttp.ClientWebSocketResponse | None = None
+    try:
+        ws = await asyncio.wait_for(
+            session.ws_connect(
+                opts.ws_url(),
+                headers={API_AUTH_HEADER: api_key},
+                # The stream reader probes the socket itself. aiohttp's ping races that
+                # probe and surfaces a dead peer as a late 1011 instead of a reconnect.
+                autoping=autoping,
+            ),
+            timeout,
+        )
+        await ws.send_str(
+            json.dumps(
+                {
+                    "type": "AudioConfig",
+                    "codec": "pcm_s16le",
+                    "sample_rate": opts.sample_rate,
+                    "channels": 1,
+                }
+            )
+        )
+        return ws
+    except aiohttp.WSServerHandshakeError as exc:
+        raise APIStatusError(
+            message=exc.message,
+            status_code=exc.status,
+            body=None,
+            retryable=exc.status >= 500,
+        ) from exc
+    except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+        raise APIConnectionError("failed to connect to Murf STT") from exc
+    except Exception:
+        if ws is not None and not ws.closed:
+            await ws.close()
+        raise
+
+
+def _speech_data(
+    language: LanguageCode,
+    transcript: str,
+    raw: dict[str, Any],
+    *,
+    include_words: bool,
+    time_offset: float,
+) -> stt.SpeechData:
+    words: list[TimedString] | None = None
+    raw_words = raw.get("words") or []
+    if include_words and raw_words:
+        words = [
+            TimedString(
+                text=word.get("word", ""),
+                start_time=float(word.get("start", 0)) + time_offset,
+                end_time=float(word.get("end", 0)) + time_offset,
+                start_time_offset=time_offset,
+            )
+            for word in raw_words
+        ]
+
+    start = raw.get("audio_window_start")
+    end = raw.get("audio_window_end")
+    if start is None and words:
+        start = float(words[0].start_time) - time_offset
+    if end is None and words:
+        end = float(words[-1].end_time) - time_offset
+
+    return stt.SpeechData(
+        language=language,
+        text=transcript,
+        start_time=(float(start) if start is not None else 0.0) + time_offset,
+        end_time=(float(end) if end is not None else 0.0) + time_offset,
+        confidence=0.0,
+        words=words,
+    )
+
+
+def _is_retryable(close_code: int | None, message: str | None) -> bool:
+    if message in _NON_RETRYABLE_MESSAGES or (message or "").startswith("Invalid"):
+        return False
+    if close_code in _NON_RETRYABLE_CLOSE_CODES:
+        return False
+    if close_code in _RETRYABLE_CLOSE_CODES:
+        return True
+    if close_code is None or close_code < 0:
+        return True
+    return close_code < 4000 or close_code >= 5000
+
+
+def _error_from_payload(data: dict[str, Any], close_code: int | None) -> APIStatusError:
+    message = str(data.get("message") or "Murf STT error")
+    return APIStatusError(
+        message=message,
+        status_code=close_code if close_code is not None else -1,
+        request_id=str((data.get("rawEvent") or {}).get("request_id") or "") or None,
+        body=data,
+        retryable=_is_retryable(close_code, message),
+    )
+
+
+def _error_from_close(
+    ws: aiohttp.ClientWebSocketResponse,
+    msg: aiohttp.WSMessage,
+    server_error: dict[str, Any] | None,
+) -> APIStatusError:
+    if server_error:
+        return _error_from_payload(server_error, ws.close_code)
+    return APIStatusError(
+        message="Murf STT connection closed unexpectedly",
+        status_code=ws.close_code or -1,
+        body=f"{msg.data=} {msg.extra=}",
+        retryable=_is_retryable(ws.close_code, None),
+    )
+
+
+def _resample_buffer(buffer: AudioBuffer, sample_rate: int) -> list[rtc.AudioFrame]:
+    if isinstance(buffer, rtc.AudioFrame):
+        combined = buffer
+    else:
+        frames = [_to_mono(frame) for frame in buffer]
+        if not frames:
+            return []
+        combined = rtc.combine_audio_frames(frames)
+
+    combined = _to_mono(combined)
+    if combined.samples_per_channel == 0:
+        return []
+    if combined.sample_rate == sample_rate:
+        return [combined]
+
+    resampler = rtc.AudioResampler(combined.sample_rate, sample_rate, num_channels=1)
+    resampled = list(resampler.push(combined))
+    resampled.extend(resampler.flush())
+    return resampled
+
+
+def _to_mono(frame: rtc.AudioFrame) -> rtc.AudioFrame:
+    if frame.num_channels == 1:
+        return frame
+
+    import array
+
+    needed = frame.samples_per_channel * frame.num_channels * 2
+    interleaved = array.array("h")
+    interleaved.frombytes(bytes(frame.data[:needed]))
+    channels = frame.num_channels
+    mono = array.array("h", [0] * frame.samples_per_channel)
+    for index in range(frame.samples_per_channel):
+        total = 0
+        for channel in range(channels):
+            total += interleaved[index * channels + channel]
+        mono[index] = int(total / channels)
+    return rtc.AudioFrame(
+        data=mono.tobytes(),
+        sample_rate=frame.sample_rate,
+        num_channels=1,
+        samples_per_channel=frame.samples_per_channel,
+    )
+
+
+class _PeriodicCollector:
+    def __init__(self, callback: Any, *, duration: float) -> None:
+        self._duration = duration
+        self._callback = callback
+        self._last_flush = time.monotonic()
+        self._total = 0.0
+
+    def push(self, value: float) -> None:
+        self._total += value
+        if time.monotonic() - self._last_flush >= self._duration:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._total > 0:
+            self._callback(self._total)
+            self._total = 0.0
+        self._last_flush = time.monotonic()
