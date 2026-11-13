@@ -16,7 +16,6 @@ from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
     APIStatusError,
-    APITimeoutError,
     LanguageCode,
     stt,
     utils,
@@ -94,6 +93,8 @@ class STT(stt.STT):
                 string, for example ``"hi,en_IN"`` or ``"fr,en"``, or as a list
                 such as ``["hi", "en_IN"]``. Murf then detects only from that set.
                 BCP-47 tags such as ``en-US`` or ``hi-IN`` are mapped to Murf's codes.
+                Any other code is sent as given, including languages this plugin does
+                not list.
             sample_rate: Sample rate of audio sent to Murf, in Hz. Incoming frames are
                 resampled to this rate. Must be one of 8000, 12000, 16000, 24000,
                 32000, 44100, 48000. Defaults to 16000.
@@ -105,7 +106,9 @@ class STT(stt.STT):
             bvc: Remove background voices before transcription. Defaults to False.
             api_key: Murf API key. Falls back to the ``MURF_API_KEY`` environment variable.
             base_url: Override the model host, for example ``https://in.api.murf.ai``.
-                When omitted, the host is chosen from ``model``.
+                When omitted, Indic languages use ``wss://in.api.murf.ai`` and
+                European languages use ``wss://us-east.api.murf.ai``. English and
+                languages this plugin does not list keep ``model``.
             http_session: Existing aiohttp session. When omitted, the plugin uses the
                 LiveKit HTTP context session.
             audio_chunk_duration_ms: Size of each binary audio frame, from 20 to 100 ms.
@@ -121,7 +124,7 @@ class STT(stt.STT):
                 interim_results=True,
                 diarization=False,
                 aligned_transcript="word",
-                offline_recognize=True,
+                offline_recognize=False,
             )
         )
 
@@ -164,109 +167,7 @@ class STT(stt.STT):
         language: NotGivenOr[STTLanguages | str | list[str]] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> stt.SpeechEvent:
-        opts = self._sanitize_options(language=language)
-        frames = _resample_buffer(buffer, opts.sample_rate)
-        if not frames:
-            return stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                alternatives=[
-                    stt.SpeechData(language=opts.language_code, text=""),
-                ],
-            )
-
-        audio_duration = sum(frame.duration for frame in frames)
-        try:
-            ws = await _connect_ws(self._ensure_session(), opts, self._api_key, conn_options.timeout)
-        except asyncio.TimeoutError:
-            raise APIConnectionError("failed to connect to Murf STT") from None
-
-        try:
-            bstream = utils.audio.AudioByteStream(
-                sample_rate=opts.sample_rate,
-                num_channels=1,
-                samples_per_channel=opts.sample_rate * opts.audio_chunk_duration_ms // 1000,
-            )
-            pcm = b"".join(frame.data.tobytes() for frame in frames)
-            chunks = bstream.push(pcm)
-            chunks.extend(bstream.flush())
-            for chunk in chunks:
-                await ws.send_bytes(chunk.data.tobytes())
-                await asyncio.sleep(chunk.duration)
-
-            await ws.send_str(json.dumps({"type": "CloseStream"}))
-
-            transcripts: list[str] = []
-            words: list[TimedString] = []
-            request_id = ""
-            start_time = 0.0
-            end_time = 0.0
-            server_error: dict[str, Any] | None = None
-            deadline = audio_duration + max(conn_options.timeout, 5.0)
-            loop = asyncio.get_running_loop()
-            started = loop.time()
-            while True:
-                remaining = deadline - (loop.time() - started)
-                if remaining <= 0:
-                    raise APITimeoutError() from None
-                msg = await asyncio.wait_for(ws.receive(), remaining)
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    if server_error or (ws.close_code not in (None, 1000, 1001)):
-                        raise _error_from_close(ws, msg, server_error)
-                    break
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                data = json.loads(msg.data)
-                msg_type = data.get("type")
-                if msg_type == "Error":
-                    server_error = data
-                    continue
-                if msg_type == "QuotaWarning":
-                    logger.warning("[Murf STT] Low balance: %s", data.get("remaining_funds"))
-                    continue
-                if msg_type != "final":
-                    continue
-                text = data.get("transcript") or ""
-                raw = data.get("rawEvent") or {}
-                request_id = raw.get("request_id") or request_id
-                if not text:
-                    continue
-                transcripts.append(text)
-                speech = _speech_data(
-                    opts.language_code,
-                    text,
-                    raw,
-                    include_words=True,
-                    time_offset=0.0,
-                )
-                if speech.words:
-                    words.extend(speech.words)
-                if len(transcripts) == 1:
-                    start_time = speech.start_time
-                end_time = speech.end_time
-
-            return stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                request_id=request_id,
-                alternatives=[
-                    stt.SpeechData(
-                        language=opts.language_code,
-                        text=" ".join(transcripts),
-                        start_time=start_time,
-                        end_time=end_time,
-                        words=words or None,
-                    )
-                ],
-            )
-        except APIStatusError:
-            raise
-        except asyncio.TimeoutError:
-            raise APITimeoutError() from None
-        finally:
-            await ws.close()
+        raise NotImplementedError("Murf STT is streaming only")
 
     def stream(
         self,
@@ -298,7 +199,8 @@ class STT(stt.STT):
         """Update options that Murf fixes at connection time.
 
         Open streams reconnect. Model, language, keywords, and audio format cannot
-        change on an existing Murf session.
+        change on an existing Murf session. A language passed to ``stream`` stays
+        on that stream when this update does not include ``language``.
         """
         opts = self._opts
         self._opts = _build_options(
@@ -313,7 +215,22 @@ class STT(stt.STT):
             audio_chunk_duration_ms=opts.audio_chunk_duration_ms,
         )
         for stream in self._streams:
-            stream.update_options(self._opts)
+            current = stream._opts
+            stream.update_options(
+                _build_options(
+                    model=model if is_given(model) else current.model,
+                    language=language if is_given(language) else current.language,
+                    sample_rate=current.sample_rate,
+                    keywords=keywords if is_given(keywords) else current.keywords,
+                    alpha=alpha if is_given(alpha) else current.alpha,
+                    text_formatting=(
+                        text_formatting if is_given(text_formatting) else current.text_formatting
+                    ),
+                    bvc=bvc if is_given(bvc) else current.bvc,
+                    base_url=base_url if is_given(base_url) else current.base_url,
+                    audio_chunk_duration_ms=current.audio_chunk_duration_ms,
+                )
+            )
 
     async def aclose(self) -> None:
         await asyncio.gather(*(stream.aclose() for stream in list(self._streams)), return_exceptions=True)
@@ -325,6 +242,10 @@ class STT(stt.STT):
             murf_language, language_code = _resolve_language(opts.model, language)
             opts.language = murf_language
             opts.language_code = language_code
+        routed = _route_model(str(opts.model), opts.language, opts.base_url)
+        if routed != opts.model and is_given(language):
+            opts.language, opts.language_code = _resolve_language(routed, language)
+        opts.model = routed
         return opts
 
 
@@ -445,7 +366,7 @@ class SpeechStream(stt.SpeechStream):
 
                 try:
                     self._process_stream_event(json.loads(msg.data))
-                except APIStatusError:
+                except (APIStatusError, _FatalMurfSTTError):
                     raise
                 except Exception:
                     logger.exception("[Murf STT] failed to process message")
@@ -594,6 +515,10 @@ def _build_options(
         )
 
     murf_language, language_code = _resolve_language(model, language)
+    routed = _route_model(str(model), murf_language, base_url)
+    if routed != model:
+        model = routed
+        murf_language, language_code = _resolve_language(model, language)
     cleaned_keywords = [term.strip() for term in keywords if term and term.strip()]
     if any("," in term for term in cleaned_keywords):
         raise ValueError("keywords cannot contain commas; pass a list of phrases instead")
@@ -651,17 +576,10 @@ def _murf_language_token(model: str, language: str) -> str:
     token = language.strip().replace("_", "-")
     pieces = token.split("-")
     base = pieces[0].lower()
-    region = pieces[1].upper() if len(pieces) > 1 and len(pieces[1]) == 2 else None
     indic = str(model).startswith("finch_indic")
 
     if indic:
         if base == "en":
-            if region not in (None, "IN"):
-                logger.warning(
-                    "[Murf STT] %s transcribes English (India). Mapping %s to en_IN",
-                    model,
-                    language,
-                )
             return "en_IN"
         if base in _INDIC_LANGUAGES:
             return base
@@ -669,7 +587,6 @@ def _murf_language_token(model: str, language: str) -> str:
         if base in _GLOBAL_LANGUAGES:
             return base
 
-    logger.warning("[Murf STT] language %s may not be supported by model %s", language, model)
     return language.strip()
 
 
@@ -688,6 +605,53 @@ def _origin_for(model: str, base_url: str | None) -> str:
     if not origin:
         raise ValueError(f"no Murf STT host for model {model!r}")
     return origin
+
+
+_ENDPOINT_TARGET = {
+    "indic": ("wss://in.api.murf.ai", "finch_indic_1.0"),
+    "global": ("wss://us-east.api.murf.ai", "finch_global_1.0"),
+}
+
+
+def _language_endpoint(token: str) -> str | None:
+    """Return ``indic`` or ``global`` when this plugin knows the code.
+
+    English and codes this plugin does not list return ``None``. Those keep the
+    caller's model and host.
+    """
+    base = token.strip().replace("-", "_").split("_")[0].lower()
+    if base == "en":
+        return None
+    if base in _GLOBAL_LANGUAGES:
+        return "global"
+    if base in _INDIC_LANGUAGES:
+        return "indic"
+    return None
+
+
+def _route_model(model: str, language: str, base_url: str | None) -> str:
+    """Pick the Murf model from the language when the caller did not set a host."""
+    if base_url or not language or language == "auto" or model not in _MODEL_ORIGINS:
+        return model
+
+    families = {
+        family
+        for token in language.split(",")
+        if (family := _language_endpoint(token)) is not None
+    }
+    if len(families) != 1:
+        return model
+
+    origin, routed = _ENDPOINT_TARGET[families.pop()]
+    if _MODEL_ORIGINS[model] == origin:
+        return model
+    logger.info(
+        "[Murf STT] language %s is served by %s at %s",
+        language,
+        routed,
+        origin,
+    )
+    return routed
 
 
 def _query_params(opts: STTOptions) -> dict[str, str]:
@@ -737,13 +701,19 @@ async def _connect_ws(
         )
         return ws
     except aiohttp.WSServerHandshakeError as exc:
-        raise APIStatusError(
-            message=exc.message,
-            status_code=exc.status,
-            body=None,
-            retryable=exc.status >= 500,
+        raise _for_stream(
+            APIStatusError(
+                message=exc.message,
+                status_code=exc.status,
+                body=None,
+                retryable=exc.status >= 500,
+            )
         ) from exc
     except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+        raise APIConnectionError("failed to connect to Murf STT") from exc
+    except aiohttp.ClientError as exc:
+        if ws is not None and not ws.closed:
+            await ws.close()
         raise APIConnectionError("failed to connect to Murf STT") from exc
     except Exception:
         if ws is not None and not ws.closed:
@@ -792,6 +762,9 @@ def _speech_data(
 def _is_retryable(close_code: int | None, message: str | None) -> bool:
     if message in _NON_RETRYABLE_MESSAGES or (message or "").startswith("Invalid"):
         return False
+    # Config mismatch. Reconnecting will get the same rejection.
+    if message and "is not served at this endpoint" in message:
+        return False
     if close_code in _NON_RETRYABLE_CLOSE_CODES:
         return False
     if close_code in _RETRYABLE_CLOSE_CODES:
@@ -801,14 +774,36 @@ def _is_retryable(close_code: int | None, message: str | None) -> bool:
     return close_code < 4000 or close_code >= 5000
 
 
-def _error_from_payload(data: dict[str, Any], close_code: int | None) -> APIStatusError:
+class _FatalMurfSTTError(Exception):
+    """Permanent Murf failure.
+
+    Agents 1.4.5 retries every APIError and ignores ``retryable``, so a fatal
+    failure is not an APIError. The wrapped status error still has
+    ``retryable=False`` for releases that honor the flag.
+    """
+
+    def __init__(self, error: APIStatusError) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.retryable = False
+
+
+def _for_stream(error: APIStatusError) -> Exception:
+    if error.retryable:
+        return error
+    return _FatalMurfSTTError(error)
+
+
+def _error_from_payload(data: dict[str, Any], close_code: int | None) -> Exception:
     message = str(data.get("message") or "Murf STT error")
-    return APIStatusError(
-        message=message,
-        status_code=close_code if close_code is not None else -1,
-        request_id=str((data.get("rawEvent") or {}).get("request_id") or "") or None,
-        body=data,
-        retryable=_is_retryable(close_code, message),
+    return _for_stream(
+        APIStatusError(
+            message=message,
+            status_code=close_code if close_code is not None else -1,
+            request_id=str((data.get("rawEvent") or {}).get("request_id") or "") or None,
+            body=data,
+            retryable=_is_retryable(close_code, message),
+        )
     )
 
 
@@ -816,59 +811,16 @@ def _error_from_close(
     ws: aiohttp.ClientWebSocketResponse,
     msg: aiohttp.WSMessage,
     server_error: dict[str, Any] | None,
-) -> APIStatusError:
+) -> Exception:
     if server_error:
         return _error_from_payload(server_error, ws.close_code)
-    return APIStatusError(
-        message="Murf STT connection closed unexpectedly",
-        status_code=ws.close_code or -1,
-        body=f"{msg.data=} {msg.extra=}",
-        retryable=_is_retryable(ws.close_code, None),
-    )
-
-
-def _resample_buffer(buffer: AudioBuffer, sample_rate: int) -> list[rtc.AudioFrame]:
-    if isinstance(buffer, rtc.AudioFrame):
-        combined = buffer
-    else:
-        frames = [_to_mono(frame) for frame in buffer]
-        if not frames:
-            return []
-        combined = rtc.combine_audio_frames(frames)
-
-    combined = _to_mono(combined)
-    if combined.samples_per_channel == 0:
-        return []
-    if combined.sample_rate == sample_rate:
-        return [combined]
-
-    resampler = rtc.AudioResampler(combined.sample_rate, sample_rate, num_channels=1)
-    resampled = list(resampler.push(combined))
-    resampled.extend(resampler.flush())
-    return resampled
-
-
-def _to_mono(frame: rtc.AudioFrame) -> rtc.AudioFrame:
-    if frame.num_channels == 1:
-        return frame
-
-    import array
-
-    needed = frame.samples_per_channel * frame.num_channels * 2
-    interleaved = array.array("h")
-    interleaved.frombytes(bytes(frame.data[:needed]))
-    channels = frame.num_channels
-    mono = array.array("h", [0] * frame.samples_per_channel)
-    for index in range(frame.samples_per_channel):
-        total = 0
-        for channel in range(channels):
-            total += interleaved[index * channels + channel]
-        mono[index] = int(total / channels)
-    return rtc.AudioFrame(
-        data=mono.tobytes(),
-        sample_rate=frame.sample_rate,
-        num_channels=1,
-        samples_per_channel=frame.samples_per_channel,
+    return _for_stream(
+        APIStatusError(
+            message="Murf STT connection closed unexpectedly",
+            status_code=ws.close_code or -1,
+            body=f"{msg.data=} {msg.extra=}",
+            retryable=_is_retryable(ws.close_code, None),
+        )
     )
 
 

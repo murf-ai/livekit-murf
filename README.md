@@ -20,7 +20,7 @@ from livekit.plugins import murf
 
 session = AgentSession(
     stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
-    tts=murf.TTS(voice="Gordon", style="Conversational", model="FALCON"),
+    tts=murf.TTS(voice="Pooja", style="Conversational", model="FALCON"),
 )
 ```
 
@@ -37,7 +37,7 @@ class MyAgent(Agent):
             instructions="You are a voice agent build using Murf",
             stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
             llm=openai.LLM(model="gpt-4o"),
-            tts=murf.TTS(voice="Gordon", style="Conversational", model="FALCON"),
+            tts=murf.TTS(voice="Pooja", style="Conversational", model="FALCON"),
             vad=get_job_context().proc.userdata["vad"],
         )
 
@@ -84,4 +84,4 @@ Partials are interim transcripts. Murf sends a final when the caller pauses. Liv
 
 You'll need an API key from [Murf AI](https://murf.ai/api). It can be set as an environment variable: `MURF_API_KEY` 
 
-> **Compatibility**: Requires livekit-agents >= 1.2.18.
+> **Compatibility**: Requires livekit-agents >= 1.4.4.
