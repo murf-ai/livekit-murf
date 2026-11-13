@@ -11,7 +11,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import aiohttp
-
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
@@ -91,7 +90,7 @@ class TTS(tts.TTS):
             api_key (str | None, optional): The Murf AI API key. If not provided, it will be read from the MURF_API_KEY environment variable.
             model (TTSModels | str, optional): The Murf AI TTS model to use. Defaults to "FALCON".
             locale (str | None, optional): The locale for synthesis (e.g., "en-US", "en-UK"). If not provided, will be inferred from voice.
-            voice (str, optional): The voice ID from Murf AI's voice library (e.g., "en-US-matthew"). Defaults to TTSDefaultVoiceId.
+            voice (str, optional): The voice ID from Murf AI's voice library (e.g., "Gordon"). Defaults to TTSDefaultVoiceId.
             style (TTSStyles | str | None, optional): The voice style to apply (e.g., "Conversation"). Can be None for default style.
             speed (int | None, optional): The speech speed control. Higher values = faster speech. None for default speed.
             pitch (int | None, optional): The speech pitch control. Higher values = higher pitch. None for default pitch.
@@ -105,7 +104,7 @@ class TTS(tts.TTS):
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
             streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
-        """  # noqa: E501
+        """
 
         self._streaming = streaming
 
@@ -165,9 +164,10 @@ class TTS(tts.TTS):
     async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
         session = self._ensure_session()
         url = self._opts.get_ws_url(
-            f"/v1/speech/stream-input?api-key={self._opts.api_key}&sample_rate={self._opts.sample_rate}&format={self._opts.encoding}&model={self._opts.model}"
+            f"/v1/speech/stream-input?sample_rate={self._opts.sample_rate}&format={self._opts.encoding}&model={self._opts.model}"
         )
-        return await asyncio.wait_for(session.ws_connect(url), timeout)
+        headers = {API_AUTH_HEADER: self._opts.api_key}
+        return await asyncio.wait_for(session.ws_connect(url, headers=headers), timeout)
 
     async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await ws.close()
@@ -198,7 +198,7 @@ class TTS(tts.TTS):
 
         Args:
             locale (str, optional): The locale for synthesis (e.g., "en-US", "en-UK").
-            voice (str, optional): The voice ID from Murf AI's voice library. (e.g. "en-US-matthew")
+            voice (str, optional): The voice ID from Murf AI's voice library. (e.g. "Gordon")
             style (str | None, optional): The voice style to apply (e.g., "Conversation", "Promo").
             speed (int | None, optional): Controls the speech speed. Positive values increase speed, negative values decrease it. Valid range: -50 to 50.
             pitch (int | None, optional): Controls the speech pitch. Positive values raise pitch, negative values lower it. Valid range: -50 to 50.
@@ -422,6 +422,8 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         try:
             async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                self._acquire_time = self._tts._pool.last_acquire_time
+                self._connection_reused = self._tts._pool.last_connection_reused
                 tasks = [
                     asyncio.create_task(_input_task()),
                     asyncio.create_task(_sentence_stream_task(ws)),
