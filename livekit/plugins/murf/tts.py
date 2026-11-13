@@ -11,7 +11,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import aiohttp
-
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
@@ -105,7 +104,7 @@ class TTS(tts.TTS):
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
             streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
-        """  # noqa: E501
+        """
 
         self._streaming = streaming
 

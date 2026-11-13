@@ -44,7 +44,6 @@ TTSStyles = Literal[
     "Terrified",
     "Inspirational",
     "Customer Support Agent",
-    "Narration",
     "Audiobook",
     "Storytelling",
     "Furious",

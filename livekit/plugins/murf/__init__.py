@@ -6,9 +6,9 @@ from .version import __version__
 
 __all__ = [
     "STT",
-    "SpeechStream",
     "TTS",
     "ChunkedStream",
+    "SpeechStream",
     "__version__",
 ]
 

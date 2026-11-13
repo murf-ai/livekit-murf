@@ -10,8 +10,6 @@ from typing import Any
 from urllib.parse import urlencode
 
 import aiohttp
-
-from livekit import rtc
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
@@ -23,6 +21,8 @@ from livekit.agents import (
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import AudioBuffer, is_given
 from livekit.agents.voice.io import TimedString
+
+from livekit import rtc
 
 from .log import logger
 from .models import STTLanguages, STTModels
@@ -295,9 +295,6 @@ class SpeechStream(stt.SpeechStream):
                 if closing_ws or self._session.closed:
                     return
                 raise APIConnectionError("Murf STT connection closed unexpectedly") from exc
-            except Exception as exc:
-                logger.warning("[Murf STT] keepalive task exited: %s", exc)
-                return
 
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -368,7 +365,7 @@ class SpeechStream(stt.SpeechStream):
                     self._process_stream_event(json.loads(msg.data))
                 except (APIStatusError, _FatalMurfSTTError):
                     raise
-                except Exception:
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
                     logger.exception("[Murf STT] failed to process message")
 
         ws: aiohttp.ClientWebSocketResponse | None = None
@@ -597,7 +594,7 @@ def _origin_for(model: str, base_url: str | None) -> str:
             return "wss://" + origin[len("https://") :]
         if origin.startswith("http://"):
             return "ws://" + origin[len("http://") :]
-        if origin.startswith("ws://") or origin.startswith("wss://"):
+        if origin.startswith(("ws://", "wss://")):
             return origin
         return f"wss://{origin}"
 
