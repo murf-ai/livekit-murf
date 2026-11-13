@@ -268,6 +268,7 @@ class SpeechStream(stt.SpeechStream):
         self._api_key = api_key
         self._session = http_session
         self._speaking = False
+        self._last_interim = ""
         self._request_id = ""
         self._server_error: dict[str, Any] | None = None
         self._reconnect_event = asyncio.Event()
@@ -294,7 +295,7 @@ class SpeechStream(stt.SpeechStream):
             except (aiohttp.ClientError, ConnectionError) as exc:
                 if closing_ws or self._session.closed:
                     return
-                raise APIConnectionError("Murf STT connection closed unexpectedly") from exc
+                raise _write_closed("keepalive", ws, exc) from exc
 
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -329,7 +330,7 @@ class SpeechStream(stt.SpeechStream):
             except (aiohttp.ClientError, ConnectionError) as exc:
                 if closing_ws or self._session.closed:
                     return
-                raise APIConnectionError("Murf STT connection closed unexpectedly") from exc
+                raise _write_closed("send", ws, exc) from exc
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -350,12 +351,29 @@ class SpeechStream(stt.SpeechStream):
                 ):
                     if closing_ws or self._session.closed:
                         return
+                    logger.error(
+                        "[Murf STT] server closed the websocket close_code=%s data=%r extra=%r server_error=%s request_id=%s",
+                        ws.close_code,
+                        msg.data,
+                        msg.extra,
+                        self._server_error,
+                        self._request_id,
+                    )
                     raise _error_from_close(ws, msg, self._server_error)
 
                 if msg.type == aiohttp.WSMsgType.ERROR:
                     if closing_ws or self._session.closed:
                         return
-                    raise APIConnectionError("Murf STT connection lost") from ws.exception()
+                    logger.error(
+                        "[Murf STT] websocket error close_code=%s exception=%r server_error=%s request_id=%s",
+                        ws.close_code,
+                        ws.exception(),
+                        self._server_error,
+                        self._request_id,
+                    )
+                    raise APIConnectionError(
+                        f"Murf STT connection lost (close_code={ws.close_code})"
+                    ) from ws.exception()
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logger.warning("[Murf STT] unexpected message type %s", msg.type)
@@ -380,12 +398,12 @@ class SpeechStream(stt.SpeechStream):
                     autoping=getattr(utils.aio, "WebSocketMonitor", None) is None,
                 )
                 self._speaking = False
+                self._last_interim = ""
                 self._server_error = None
-                tasks = [
-                    asyncio.create_task(send_task(ws)),
-                    asyncio.create_task(recv_task(ws)),
-                    asyncio.create_task(keepalive_task(ws)),
-                ]
+                send_worker = asyncio.create_task(send_task(ws))
+                recv_worker = asyncio.create_task(recv_task(ws))
+                keepalive_worker = asyncio.create_task(keepalive_task(ws))
+                tasks = [send_worker, recv_worker, keepalive_worker]
                 tasks_group = asyncio.gather(*tasks)
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
                 try:
@@ -393,9 +411,8 @@ class SpeechStream(stt.SpeechStream):
                         (tasks_group, wait_reconnect_task),
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for task in done:
-                        if task != wait_reconnect_task:
-                            task.result()
+                    if tasks_group in done:
+                        await self._raise_connection_failure(ws, tasks_group, recv_worker)
 
                     if wait_reconnect_task not in done:
                         break
@@ -411,6 +428,53 @@ class SpeechStream(stt.SpeechStream):
                 if ws is not None:
                     await ws.close()
 
+    async def _raise_connection_failure(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        tasks_group: asyncio.Future[Any],
+        recv_worker: asyncio.Task[None],
+    ) -> None:
+        group_exc = tasks_group.exception()
+        if group_exc is None:
+            return
+        # A writer usually fails before recv reads the close frame. Wait briefly so
+        # the server close code and Error payload are on the exception we raise.
+        if not isinstance(group_exc, (APIStatusError, _FatalMurfSTTError)) and not recv_worker.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(recv_worker), 0.5)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Murf STT] received error: %s", exc)
+        recv_exc = (
+            recv_worker.exception()
+            if recv_worker.done() and not recv_worker.cancelled()
+            else None
+        )
+        tracked: BaseException = group_exc
+        if isinstance(recv_exc, (APIStatusError, APIConnectionError, _FatalMurfSTTError)):
+            tracked = recv_exc
+        elif self._server_error is not None:
+            tracked = _error_from_payload(self._server_error, ws.close_code)
+        elif ws.close_code:
+            tracked = _error_from_close(
+                ws,
+                aiohttp.WSMessage(aiohttp.WSMsgType.CLOSED, None, None),
+                self._server_error,
+            )
+        logger.error(
+            "[Murf STT] connection lost close_code=%s closed=%s ws_exception=%r server_error=%s request_id=%s error=%s",
+            ws.close_code,
+            ws.closed,
+            ws.exception(),
+            self._server_error,
+            self._request_id,
+            tracked,
+        )
+        if tracked is group_exc:
+            raise group_exc
+        raise tracked from group_exc
+
     def _on_audio_duration_report(self, duration: float) -> None:
         self._event_ch.send_nowait(
             stt.SpeechEvent(
@@ -422,31 +486,43 @@ class SpeechStream(stt.SpeechStream):
         )
 
     def _process_stream_event(self, data: dict[str, Any]) -> None:
-        msg_type = data.get("type")
+        msg_type, raw, transcript = _coerce_turn(data)
         if msg_type == "QuotaWarning":
             logger.warning("[Murf STT] Low balance: %s", data.get("remaining_funds"))
             return
         if msg_type == "Error":
             self._server_error = data
+            logger.error(
+                "[Murf STT] server error message=%s request_id=%s payload=%s",
+                data.get("message"),
+                self._request_id,
+                data,
+            )
             raise _error_from_payload(data, None)
         if msg_type not in ("partial", "final"):
             logger.debug("[Murf STT] unexpected message %s", data)
             return
 
-        raw = data.get("rawEvent") or {}
-        transcript = data.get("transcript") or ""
         request_id = str(raw.get("request_id") or "")
         if request_id:
             self._request_id = request_id
 
         event_name = raw.get("event")
+        if event_name == "StartOfTurn":
+            self._last_interim = ""
+        # type=final is the turn end. EndOfTurn is the same signal if it arrives
+        # on another message, including one with an empty transcript.
+        turn_ended = msg_type == "final" or event_name == "EndOfTurn"
         if (event_name == "StartOfTurn" or transcript) and not self._speaking:
             self._speaking = True
             self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
 
-        if msg_type == "partial":
+        if not turn_ended:
+            # StartOfTurn often has no words yet. Keep a partial that carries
+            # text on the TurnInfo even when the outer transcript is empty.
             if not transcript:
                 return
+            self._last_interim = transcript
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -464,7 +540,13 @@ class SpeechStream(stt.SpeechStream):
             )
             return
 
-        if transcript:
+        # A pause can end the turn with an empty transcript. The last partial is
+        # the utterance, and the turn still has to close or the agent stays speaking.
+        if not transcript:
+            transcript = self._last_interim
+        self._last_interim = ""
+
+        if transcript or self._speaking:
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -718,6 +800,46 @@ async def _connect_ws(
         raise
 
 
+def _coerce_turn(data: dict[str, Any]) -> tuple[str | None, dict[str, Any], str]:
+    """Normalize a Murf transcript message.
+
+    The server usually wraps a TurnInfo in ``type=partial|final``. It can also
+    send the TurnInfo itself, or put the only text on ``rawEvent.transcript``.
+    """
+    msg_type = data.get("type")
+    if msg_type in ("QuotaWarning", "Error"):
+        return msg_type if isinstance(msg_type, str) else None, {}, ""
+
+    raw = data.get("rawEvent")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if msg_type == "TurnInfo" or (
+        msg_type not in ("partial", "final") and data.get("event") in ("StartOfTurn", "Update", "EndOfTurn")
+    ):
+        raw = data
+        msg_type = "final" if data.get("event") == "EndOfTurn" else "partial"
+
+    transcript = data.get("transcript") if raw is not data else ""
+    if not isinstance(transcript, str) or not transcript:
+        nested = raw.get("transcript")
+        transcript = nested if isinstance(nested, str) else ""
+    if not transcript:
+        words = raw.get("words")
+        if isinstance(words, list):
+            transcript = " ".join(
+                word.get("word", "")
+                for word in words
+                if isinstance(word, dict) and isinstance(word.get("word"), str) and word.get("word")
+            )
+    return msg_type if isinstance(msg_type, str) else None, raw, transcript
+
+
 def _speech_data(
     language: LanguageCode,
     transcript: str,
@@ -732,8 +854,8 @@ def _speech_data(
         words = [
             TimedString(
                 text=word.get("word", ""),
-                start_time=float(word.get("start", 0)) + time_offset,
-                end_time=float(word.get("end", 0)) + time_offset,
+                start_time=float(word.get("start") or 0) + time_offset,
+                end_time=float(word.get("end") or 0) + time_offset,
                 start_time_offset=time_offset,
             )
             for word in raw_words
@@ -804,6 +926,24 @@ def _error_from_payload(data: dict[str, Any], close_code: int | None) -> Excepti
     )
 
 
+def _write_closed(
+    source: str,
+    ws: aiohttp.ClientWebSocketResponse,
+    exc: BaseException,
+) -> APIConnectionError:
+    logger.error(
+        "[Murf STT] %s write failed close_code=%s closed=%s ws_exception=%r cause=%r",
+        source,
+        ws.close_code,
+        ws.closed,
+        ws.exception(),
+        exc,
+    )
+    return APIConnectionError(
+        f"Murf STT connection closed unexpectedly during {source} (close_code={ws.close_code})"
+    )
+
+
 def _error_from_close(
     ws: aiohttp.ClientWebSocketResponse,
     msg: aiohttp.WSMessage,
@@ -813,7 +953,7 @@ def _error_from_close(
         return _error_from_payload(server_error, ws.close_code)
     return _for_stream(
         APIStatusError(
-            message="Murf STT connection closed unexpectedly",
+            message=f"Murf STT connection closed unexpectedly (close_code={ws.close_code})",
             status_code=ws.close_code or -1,
             body=f"{msg.data=} {msg.extra=}",
             retryable=_is_retryable(ws.close_code, None),
