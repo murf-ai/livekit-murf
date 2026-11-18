@@ -15,6 +15,14 @@ Use this package for both speech and transcription. `murf.TTS` follows the same 
 pip install livekit-murf
 ```
 
+TTS and STT only (pure Python). For background voice cancellation on the agent's audio input:
+
+```bash
+pip install "livekit-murf[bvc]"
+```
+
+That pulls the platform-specific [`livekit-plugins-murf-bvc`](https://pypi.org/project/livekit-plugins-murf-bvc/) wheel (native `libmurf_bvc` for your OS/arch). Pip downloads only that platform's wheel.
+
 ```python
 from livekit.plugins import murf
 
@@ -22,6 +30,39 @@ session = AgentSession(
     stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
     tts=murf.TTS(voice="Pooja", style="Conversational", model="FALCON"),
 )
+```
+
+### Background voice cancellation (optional)
+
+Requires `pip install "livekit-murf[bvc]"`, a Murf API key with BVC enabled (`MURF_API_KEY`), and Linux (glibc 2.28+) or macOS.
+
+```python
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobProcess, cli, room_io
+from livekit.plugins import murf, murf_bvc
+
+server = AgentServer()
+
+def prewarm(proc: JobProcess):
+    murf_bvc.prewarm()
+
+server.setup_fnc = prewarm
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+    session = AgentSession(
+        stt=murf.STT(model="finch_global_1.0"),
+        tts=murf.TTS(voice="Natalie", style="Conversational", model="FALCON"),
+    )
+    await session.start(
+        room=ctx.room,
+        agent=Agent(instructions="You are a helpful assistant."),
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(noise_cancellation=murf_bvc.BVC()),
+        ),
+    )
+
+if __name__ == "__main__":
+    cli.run_app(server)
 ```
 
 ## Livekit Starter Project
