@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "livekit-murf"
 dynamic = ["version"]
-description = "LiveKit Agents Plugin for Murf"
+description = "LiveKit Agents Plugin for Murf (TTS, STT; optional BVC via [bvc])"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10,<3.15"
@@ -26,6 +26,10 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = ["livekit-agents>=1.5.2"]
+
+[project.optional-dependencies]
+# Platform wheel with native libmurf_bvc (manylinux / macOS). Pip picks the matching wheel only.
+bvc = ["livekit-plugins-murf-bvc>=0.3.0.post1"]
 
 [project.urls]
 Repository = "https://github.com/murf-ai/livekit-murf"
