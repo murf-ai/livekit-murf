@@ -29,7 +29,7 @@ TTSLocales = Literal[
     "bg-BG",
 ]
 
-TTSModels = Literal["GEN2", "FALCON"]
+TTSModels = Literal["falcon-2.1"]
 
 TTSStyles = Literal[
     "Promo",
@@ -57,7 +57,7 @@ TTSEncoding = Literal[
 ]
 
 TTSDefaultVoiceId = "Gordon"
-TTSDefaultVoiceStyle = "Conversation"
+TTSDefaultVoiceStyle = "Conversational"
 
 STTModels = Literal["finch_indic_1.0", "finch_global_1.0"]
 

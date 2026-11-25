@@ -20,7 +20,12 @@ from livekit.agents import (
     tts,
     utils,
 )
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
+from livekit.agents.types import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    NotGivenOr,
+    TimedString,
+)
 from livekit.agents.utils import is_given
 
 from .log import logger
@@ -34,6 +39,21 @@ from .models import (
 )
 
 API_AUTH_HEADER = "api-key"
+
+# Falcon model identifiers accepted by Murf (falcon-2.1 is canonical; older aliases map to it).
+_FALCON_MODELS = frozenset({"falcon-2.1", "falcon-2", "falcon2", "falcon"})
+
+# Locales for which Murf's word timestamps are not supported. The backend may still send
+# them when requested; the plugin discards them (with a warning).
+_WORD_TIMESTAMP_UNSUPPORTED_LOCALES = frozenset({"zh-CN", "ja-JP", "ko-KR"})
+
+
+def _model_supports_word_timestamps(model: str) -> bool:
+    return str(model).lower() in _FALCON_MODELS
+
+
+def _locale_supports_word_timestamps(locale: str | None) -> bool:
+    return not (locale and locale in _WORD_TIMESTAMP_UNSUPPORTED_LOCALES)
 
 
 @dataclass
@@ -51,6 +71,8 @@ class _TTSOptions:
     min_buffer_size: int
     max_buffer_delay_in_ms: int
     verbose: bool
+    word_timestamps: bool = False  # request timestamps from Murf (add_word_timestamps)
+    discard_word_timestamps: bool = False  # locale unsupported: drop received timestamps
 
     def get_http_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -64,7 +86,7 @@ class TTS(tts.TTS):
         self,
         *,
         api_key: str | None = None,
-        model: TTSModels | str = "FALCON",
+        model: TTSModels | str = "falcon-2.1",
         locale: TTSLocales | str | None = None,
         voice: str = TTSDefaultVoiceId,
         style: TTSStyles | str | None = None,
@@ -80,18 +102,20 @@ class TTS(tts.TTS):
         max_buffer_delay_in_ms: int = 0,
         streaming: bool = True,
         verbose: bool = False,
+        word_timestamps: bool = True,
     ) -> None:
         """
         Create a new instance of Murf AI TTS.
 
-        See https://murf.ai/api/docs/api-reference/text-to-speech/stream-input for more details on the the Murf AI API.
+        See https://murf.ai/api/docs/text-to-speech-models/falcon-2-1 and
+        https://murf.ai/api/docs/api-reference/text-to-speech/stream-input for more details on the Murf AI API.
 
         Args:
             api_key (str | None, optional): The Murf AI API key. If not provided, it will be read from the MURF_API_KEY environment variable.
-            model (TTSModels | str, optional): The Murf AI TTS model to use. Defaults to "FALCON".
+            model (TTSModels | str, optional): The Murf AI TTS model to use. Defaults to "falcon-2.1".
             locale (str | None, optional): The locale for synthesis (e.g., "en-US", "en-UK"). If not provided, will be inferred from voice.
             voice (str, optional): The voice ID from Murf AI's voice library (e.g., "Gordon"). Defaults to TTSDefaultVoiceId.
-            style (TTSStyles | str | None, optional): The voice style to apply (e.g., "Conversation"). Can be None for default style.
+            style (TTSStyles | str | None, optional): The voice style to apply (e.g., "Conversational"). Can be None for default style.
             speed (int | None, optional): The speech speed control. Higher values = faster speech. None for default speed.
             pitch (int | None, optional): The speech pitch control. Higher values = higher pitch. None for default pitch.
             sample_rate (int, optional): The audio sample rate in Hz. Defaults to 24000.
@@ -104,12 +128,17 @@ class TTS(tts.TTS):
             max_buffer_delay_in_ms (int, optional): Maximum wait time before sending buffered text if min_buffer_size isn’t reached. Defaults to 0.
             verbose (bool, optional): Enable detailed Murf logging. When True, logs TTFB, latency metrics, buffer configuration, and other diagnostic information. Also enabled when logger level is DEBUG. Defaults to False.
             streaming (bool, optional): If True, uses WebSocket streaming for real-time audio. If False, uses HTTP requests. Defaults to True.
+            word_timestamps (bool, optional): Request word-level timestamps on the WebSocket stream and expose them as an aligned transcript. Only supported by Falcon models (disabled with an info log otherwise). For zh-CN/ja-JP/ko-KR locales, timestamps returned by Murf are discarded with a warning and `aligned_transcript` is False. Defaults to True.
         """
 
         self._streaming = streaming
+        self._word_timestamps_requested = word_timestamps
+        send_ts, discard_ts = self._resolve_word_timestamps(model=model, locale=locale)
 
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=streaming),
+            capabilities=tts.TTSCapabilities(
+                streaming=streaming, aligned_transcript=send_ts and not discard_ts
+            ),
             sample_rate=sample_rate,
             num_channels=1,
         )
@@ -132,6 +161,8 @@ class TTS(tts.TTS):
             min_buffer_size=min_buffer_size,
             max_buffer_delay_in_ms=max_buffer_delay_in_ms,
             verbose=verbose,
+            word_timestamps=send_ts,
+            discard_word_timestamps=discard_ts,
         )
         self._session = http_session
         self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
@@ -157,6 +188,24 @@ class TTS(tts.TTS):
     @property
     def provider(self) -> str:
         return "Murf"
+
+    def _resolve_word_timestamps(self, *, model: str, locale: str | None) -> tuple[bool, bool]:
+        """Return (request_timestamps, discard_timestamps)."""
+        if not self._word_timestamps_requested:
+            return False, False
+        if not _model_supports_word_timestamps(model):
+            logger.info(
+                "[Murf TTS] Word timestamps disabled: model %s does not support them (Falcon only)",
+                model,
+            )
+            return False, False
+        if not _locale_supports_word_timestamps(locale):
+            logger.info(
+                "[Murf TTS] Locale %s does not support word timestamps; any returned timestamps will be discarded",
+                locale,
+            )
+            return True, True
+        return True, False
 
     def _is_verbose(self) -> bool:
         return self._opts.verbose or logger.isEnabledFor(logging.DEBUG)
@@ -199,12 +248,18 @@ class TTS(tts.TTS):
         Args:
             locale (str, optional): The locale for synthesis (e.g., "en-US", "en-UK").
             voice (str, optional): The voice ID from Murf AI's voice library. (e.g. "Gordon")
-            style (str | None, optional): The voice style to apply (e.g., "Conversation", "Promo").
+            style (str | None, optional): The voice style to apply (e.g., "Conversational", "Promo").
             speed (int | None, optional): Controls the speech speed. Positive values increase speed, negative values decrease it. Valid range: -50 to 50.
             pitch (int | None, optional): Controls the speech pitch. Positive values raise pitch, negative values lower it. Valid range: -50 to 50.
         """
         if is_given(locale):
             self._opts.locale = locale
+            send_ts, discard_ts = self._resolve_word_timestamps(
+                model=self._opts.model, locale=locale
+            )
+            self._opts.word_timestamps = send_ts
+            self._opts.discard_word_timestamps = discard_ts
+            self._capabilities.aligned_transcript = send_ts and not discard_ts
         if is_given(voice):
             self._opts.voice = voice
         if is_given(style):
@@ -381,6 +436,10 @@ class SynthesizeStream(tts.SynthesizeStream):
             nonlocal first_chunk_sent_time
             current_segment_id: str | None = None
             first_audio_received = True
+            timestamps_requested = self._opts.word_timestamps
+            discard_timestamps = self._opts.discard_word_timestamps
+            timestamps_received = False
+            discard_warned = False
             await input_sent_event.wait()
             while True:
                 msg = await ws.receive()
@@ -403,6 +462,21 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if current_segment_id is None:
                     current_segment_id = segment_id
                     output_emitter.start_segment(segment_id=current_segment_id)
+                ts = data.get("timestamps")
+                words = ts.get("words") if isinstance(ts, dict) else None
+                if words and timestamps_requested:
+                    if discard_timestamps:
+                        if not discard_warned:
+                            discard_warned = True
+                            logger.warning(
+                                "[Murf TTS] Discarding word timestamps: locale %s does not support them",
+                                self._opts.locale,
+                            )
+                    else:
+                        timed = _parse_word_timestamps(words)
+                        if timed:
+                            timestamps_received = True
+                            output_emitter.push_timed_transcript(timed)
                 if data.get("audio"):
                     if first_audio_received:
                         first_audio_received = False
@@ -413,11 +487,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                     b64data = base64.b64decode(data["audio"])
                     output_emitter.push(b64data)
                 elif data.get("final"):
+                    if timestamps_requested and not discard_timestamps and not timestamps_received:
+                        logger.warning("[Murf TTS] Context %s completed without word timestamps", segment_id)
                     if sent_tokenizer_stream.closed:
                         # close only if the input stream is closed
                         output_emitter.end_input()
                         break
-                else:
+                elif not words:
                     logger.warning("[Murf TTS] Unexpected message %s", data)
 
         try:
@@ -466,8 +542,40 @@ def _to_murf_websocket_pkt(opts: _TTSOptions) -> dict[str, Any]:
     if opts.locale:
         voice_config["multi_native_locale"] = opts.locale
 
-    return {
+    pkt: dict[str, Any] = {
         "voice_config": voice_config,
         "min_buffer_size": opts.min_buffer_size,
         "max_buffer_delay_in_ms": opts.max_buffer_delay_in_ms,
     }
+    if opts.word_timestamps:
+        # Murf treats this flag as connection-wide; sockets are pooled, so send it on every frame.
+        pkt["add_word_timestamps"] = True
+    return pkt
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _parse_word_timestamps(words: Any) -> list[TimedString]:
+    timed: list[TimedString] = []
+    if not isinstance(words, list):
+        logger.warning("[Murf TTS] Invalid word timestamps payload: %r", words)
+        return timed
+    for entry in words:
+        if not isinstance(entry, dict):
+            logger.warning("[Murf TTS] Skipping non-object word timestamp: %r", entry)
+            continue
+        word = entry.get("word")
+        if not isinstance(word, str) or not word:
+            logger.warning("[Murf TTS] Skipping word timestamp with invalid word: %r", entry)
+            continue
+        start_s, end_s = entry.get("start_s"), entry.get("end_s")
+        if not _is_number(start_s) or not _is_number(end_s):
+            logger.warning("[Murf TTS] Skipping word timestamp with non-numeric times: %r", entry)
+            continue
+        if start_s > end_s:
+            logger.warning("[Murf TTS] Skipping word timestamp with start_s > end_s: %r", entry)
+            continue
+        timed.append(TimedString(text=f"{word} ", start_time=float(start_s), end_time=float(end_s)))
+    return timed

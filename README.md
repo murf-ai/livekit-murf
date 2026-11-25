@@ -28,7 +28,7 @@ from livekit.plugins import murf
 
 session = AgentSession(
     stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
-    tts=murf.TTS(voice="Pooja", style="Conversational", model="FALCON"),
+    tts=murf.TTS(voice="Pooja", style="Conversational", model="falcon-2.1"),
 )
 ```
 
@@ -51,7 +51,7 @@ server.setup_fnc = prewarm
 async def entrypoint(ctx: JobContext):
     session = AgentSession(
         stt=murf.STT(model="finch_global_1.0"),
-        tts=murf.TTS(voice="Natalie", style="Conversational", model="FALCON"),
+        tts=murf.TTS(voice="Natalie", style="Conversational", model="falcon-2.1"),
     )
     await session.start(
         room=ctx.room,
@@ -78,7 +78,7 @@ class MyAgent(Agent):
             instructions="You are a voice agent build using Murf",
             stt=murf.STT(model="finch_indic_1.0", language="hi,te"),
             llm=openai.LLM(model="gpt-4o"),
-            tts=murf.TTS(voice="Pooja", style="Conversational", model="FALCON"),
+            tts=murf.TTS(voice="Pooja", style="Conversational", model="falcon-2.1"),
             vad=get_job_context().proc.userdata["vad"],
         )
 
@@ -137,20 +137,35 @@ The API key is read from `MURF_API_KEY` when `api_key` is omitted.
 tts = murf.TTS(
     voice="Pooja",
     style="Conversational",
-    model="FALCON",
+    model="falcon-2.1",
 )
 ```
 
 ### Parameters
 
-- **`model`** (optional) — Default: `FALCON`. Murf TTS model. Valid values are `FALCON` and `GEN2`.
+- **`model`** (optional) — Default: `falcon-2.1`. Murf TTS model. See [Falcon 2.1](https://murf.ai/api/docs/text-to-speech-models/falcon-2-1).
 - **`voice`** (optional) — Default: `Gordon`. Voice ID from [Murf's voice library](https://murf.ai/api/docs/voices-styles/voice-library).
-- **`style`** (optional) — Default: `Conversation`. Voice style, for example `Conversational`, `Narration`, or `Promo`. See the [voice library](https://murf.ai/api/docs/voices-styles/voice-library) for the styles each voice supports.
+- **`style`** (optional) — Default: `Conversational`. Voice style, for example `Conversational`, `Narration`, or `Promo`. See the [voice library](https://murf.ai/api/docs/voices-styles/voice-library) for the styles each voice supports.
 - **`locale`** (optional) — Locale for synthesis, for example `en-US` or `hi-IN`. When omitted, the locale is inferred from the voice.
 - **`speed`** (optional) — Speech speed. Positive values are faster and negative values are slower. Valid range: `-50` to `50`.
 - **`pitch`** (optional) — Speech pitch. Positive values are higher and negative values are lower. Valid range: `-50` to `50`.
+- **`word_timestamps`** (optional) — Default: `True`. Request word-level timestamps and expose them as an aligned transcript. See [Word timestamps](#word-timestamps).
 
 `sample_rate` defaults to `24000` and `encoding` defaults to `pcm`. The API key is read from `MURF_API_KEY` when `api_key` is omitted. `update_options()` changes `locale`, `voice`, `style`, `speed`, and `pitch` for later audio.
+
+### Word timestamps
+
+Word timestamps are on by default. Each word is pushed as a timed transcript with its start and end time in seconds, and `aligned_transcript` is `True`.
+
+- **Models:** Only Falcon models (`falcon-2.1`, and the older aliases `falcon-2`, `falcon2` and `falcon`) request timestamps. Other models turn them off and log an info message.
+- **Transport:** Timestamps are requested over the WebSocket stream. The HTTP path (`streaming=False`) does not request them.
+- **Unsupported locales:** For `zh-CN`, `ja-JP` and `ko-KR`, Murf returns placeholder words (`<unk>`) with valid times. The plugin discards them, logs a warning, and sets `aligned_transcript` to `False`.
+- **Locale changes:** `update_options(locale=...)` re-applies these rules. The change takes effect for streams started after the call. A stream already running keeps the locale and timestamp setting it started with.
+
+```python
+# Disable word timestamps
+tts = murf.TTS(word_timestamps=False)
+```
 
 ## Pre-requisites
 
